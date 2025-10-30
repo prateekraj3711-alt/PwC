@@ -17,6 +17,17 @@ const CLEANUP_INTERVAL = 60 * 1000;
 const sessions = new Map();
 const startTime = Date.now();
 
+function chromiumLaunchOptions() {
+  const o = {
+    headless: true,
+    args: ['--no-sandbox', '--disable-setuid-sandbox']
+  };
+  if (process.env.CHROMIUM_PATH && process.env.CHROMIUM_PATH.trim() !== '') {
+    o.executablePath = process.env.CHROMIUM_PATH;
+  }
+  return o;
+}
+
 async function ensureTmpDir() {
   const dir = path.join('/tmp', 'pwc');
   try {
@@ -82,10 +93,7 @@ app.post('/start-login', async (req, res) => {
 
     const sessionId = uuidv4();
     const stateToken = uuidv4();
-    browser = await chromium.launch({ 
-      headless: true,
-      args: ['--no-sandbox', '--disable-setuid-sandbox']
-    });
+    browser = await chromium.launch(chromiumLaunchOptions());
     const context = await browser.newContext();
     const page = await context.newPage();
 
@@ -182,10 +190,7 @@ app.post('/complete-login', async (req, res) => {
         const storageStateData = await fs.readFile(sessionPath, 'utf-8');
         const storageState = JSON.parse(storageStateData);
         
-        browser = await chromium.launch({ 
-          headless: true,
-          args: ['--no-sandbox', '--disable-setuid-sandbox']
-        });
+        browser = await chromium.launch(chromiumLaunchOptions());
         const context = await browser.newContext({ storageState });
         const page = await context.newPage();
         
@@ -370,4 +375,5 @@ app.get('/health', (req, res) => {
   });
 });
 
-app.listen(PORT, () => {});
+app.listen(PORT, '0.0.0.0', () => {});
+
