@@ -206,12 +206,35 @@ app.post('/start-login', async (req, res) => {
             await page.waitForSelector('input[placeholder*="verification" i]', { timeout: 5000 });
             otpSelector = 'input[placeholder*="verification" i]';
           } catch (e2) {
-            await browser.close();
-            return res.status(500).json({
-              ok: false,
-              error: 'OTP field not found',
-              details: { step: 'otp:input' }
-            });
+            try {
+              await page.waitForSelector('input[type="tel"]', { timeout: 5000 });
+              otpSelector = 'input[type="tel"]';
+            } catch (e3) {
+              try {
+                await page.waitForSelector('input[name*="code" i]', { timeout: 5000 });
+                otpSelector = 'input[name*="code" i]';
+              } catch (e4) {
+                try {
+                  await page.waitForSelector('input[id*="code" i]', { timeout: 5000 });
+                  otpSelector = 'input[id*="code" i]';
+                } catch (e5) {
+                  try {
+                    await page.waitForSelector('input[name*="verification" i], input[id*="verification" i], input[aria-label*="verification" i], input[aria-label*="one-time" i]', { timeout: 5000 });
+                    otpSelector = 'input[name*="verification" i], input[id*="verification" i], input[aria-label*="verification" i], input[aria-label*="one-time" i]';
+                  } catch (e6) {
+                    try {
+                      await page.waitForSelector('text="Resend Code"', { timeout: 2000 });
+                    } catch (_) {}
+                    await browser.close();
+                    return res.status(500).json({
+                      ok: false,
+                      error: 'OTP field not found',
+                      details: { step: 'otp:input' }
+                    });
+                  }
+                }
+              }
+            }
           }
         }
       }
