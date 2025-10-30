@@ -65,6 +65,24 @@ async function waitForAnySelector(page, selectors, timeoutPer = 5000) {
   return null;
 }
 
+async function findOtpInputInAllFrames(page, totalTimeoutMs = 30000) {
+  const end = Date.now() + totalTimeoutMs;
+  const selectorCombined = 'input[placeholder*="One-time verification code" i], input[aria-label*="One-time verification code" i], input[autocomplete="one-time-code"], input[type="text"][inputmode="numeric" i], input[type="tel"], input[name="callback_2"], input[name*="otp" i], input[id*="otp" i], input[placeholder*="verification" i], input[name*="code" i], input[id*="code" i], input[name*="verification" i], input[id*="verification" i], input[aria-label*="verification" i], input[aria-label*="one-time" i]';
+  while (Date.now() < end) {
+    const frames = page.frames();
+    for (const fr of frames) {
+      try {
+        let loc = fr.locator('text=One-time verification code').locator('..').locator('input').first();
+        try { await loc.waitFor({ state: 'visible', timeout: 1000 }); return { frame: fr, locator: loc }; } catch (_) {}
+        loc = fr.locator(selectorCombined).first();
+        try { await loc.waitFor({ state: 'visible', timeout: 1000 }); return { frame: fr, locator: loc }; } catch (_) {}
+      } catch (_) {}
+    }
+    await page.waitForTimeout(500);
+  }
+  return null;
+}
+
 async function ensureTmpDir() {
   const dir = path.join('/tmp', 'pwc');
   try {
@@ -196,27 +214,12 @@ app.post('/start-login', async (req, res) => {
       ]);
     } catch (_) {}
 
-    // Prefer the visible label text, then fallback to broad inputs, then retry loop
-    let otpLocator = page.locator('text=One-time verification code').locator('..').locator('input').first();
-    let found = false;
-    try { await otpLocator.waitFor({ state: 'visible', timeout: 6000 }); found = true; } catch (_) {}
-    if (!found) {
-      otpLocator = page.locator(
-        'input[placeholder*="One-time verification code" i], input[aria-label*="One-time verification code" i], input[autocomplete="one-time-code"], input[type="text"][inputmode="numeric" i], input[type="tel"], input[name="callback_2"], input[name*="otp" i], input[id*="otp" i], input[placeholder*="verification" i], input[name*="code" i], input[id*="code" i], input[name*="verification" i], input[id*="verification" i], input[aria-label*="verification" i], input[aria-label*="one-time" i]'
-      ).first();
-      try { await otpLocator.waitFor({ state: 'visible', timeout: 9000 }); found = true; } catch (_) {}
-    }
-    if (!found) {
-      for (let i = 0; i < 10; i++) {
-        const count = await page.locator('input[type="text"], input[type="tel"]').count();
-        if (count > 0) { otpLocator = page.locator('input[type="text"], input[type="tel"]').first(); found = true; break; }
-        await page.waitForTimeout(2000);
-      }
-    }
-    if (!found) {
+    const otpInAny = await findOtpInputInAllFrames(page, 30000);
+    if (!otpInAny) {
       try { await page.waitForSelector('text="Resend Code"', { timeout: 2000 }); } catch (_) {}
+      const scr = await page.screenshot({ fullPage: true }).catch(() => null);
       await browser.close();
-      return res.status(500).json({ ok: false, error: 'OTP field not found', details: { step: 'otp:input' } });
+      return res.status(500).json({ ok: false, error: 'OTP field not found', details: { step: 'otp:input' }, screenshot_base64: scr ? scr.toString('base64') : undefined });
     }
 
     const sessionPath = await getSessionPath(sessionId);
@@ -292,28 +295,13 @@ app.post('/complete-login', async (req, res) => {
     const { page, context } = session;
 
     try {
-      let input = page.locator('text=One-time verification code').locator('..').locator('input').first();
-      let ok = true;
-      try { await input.waitFor({ state: 'visible', timeout: 6000 }); } catch (_) { ok = false; }
-      if (!ok) {
-        input = page.locator(
-          'input[placeholder*="One-time verification code" i], input[aria-label*="One-time verification code" i], input[autocomplete="one-time-code"], input[type="text"][inputmode="numeric" i], input[type="tel"], input[name="callback_2"], input[name*="otp" i], input[id*="otp" i], input[placeholder*="verification" i], input[name*="code" i], input[id*="code" i], input[name*="verification" i], input[id*="verification" i], input[aria-label*="verification" i], input[aria-label*="one-time" i]'
-        ).first();
-        await input.waitFor({ state: 'visible', timeout: 9000 });
-      }
-      await input.fill(otp);
-    } catch {
-      let filled = false;
-      for (let i = 0; i < 5; i++) {
-        const count = await page.locator('input[type="text"], input[type="tel"]').count();
-        if (count > 0) {
-          await page.locator('input[type="text"], input[type="tel"]').first().fill(otp);
-          filled = true;
-          break;
-        }
-        await page.waitForTimeout(2000);
-      }
-      if (!filled) throw new Error('otp input not visible');
+      const found = await findOtpInputInAllFrames(page, 30000);
+      if (!found) throw new Error('otp input not visible');
+      await found.locator.fill(otp);
+      try { await found.frame.locator('button:has-text("Submit")').click(); } catch (_) { await page.locator('button:has-text("Submit")').click().catch(() => {}); }
+    } catch (e) {
+      const scr = await page.screenshot({ fullPage: true }).catch(() => null);
+      return res.status(500).json({ ok: false, error: 'OTP field not found', details: { step: 'otp:input', reason: String(e && e.message ? e.message : e) }, screenshot_base64: scr ? scr.toString('base64') : undefined });
     }
 
     try {
