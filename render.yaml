@@ -15,7 +15,7 @@ services:
       - key: NODE_ENV
         value: production
       - key: PLAYWRIGHT_BROWSERS_PATH
-        value: /tmp/pw-browsers
+        value: "0"
       - key: PLAYWRIGHT_SKIP_VALIDATE_HOST_REQUIREMENTS
         value: "1"
 
