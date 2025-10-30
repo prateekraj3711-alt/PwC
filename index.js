@@ -54,6 +54,21 @@ async function cleanupExpiredSessions() {
 
 setInterval(cleanupExpiredSessions, CLEANUP_INTERVAL);
 
+app.get('/', (req, res) => {
+  return res.status(200).json({
+    ok: true,
+    message: 'PwC Login Automation API',
+    endpoints: {
+      'POST /start-login': 'Initiate login and wait for OTP',
+      'POST /complete-login': 'Complete login with OTP (requires session_id and otp)',
+      'DELETE /sessions/all': 'Delete all sessions',
+      'DELETE /sessions/:session_id': 'Delete specific session',
+      'GET /health': 'Health check with uptime'
+    },
+    version: '1.0.0'
+  });
+});
+
 app.post('/start-login', async (req, res) => {
   let browser = null;
   try {
@@ -268,40 +283,6 @@ app.post('/complete-login', async (req, res) => {
   }
 });
 
-app.delete('/sessions/:session_id', async (req, res) => {
-  const sessionId = req.params.session_id;
-  const session = sessions.get(sessionId);
-
-  if (!session) {
-    return res.status(404).json({
-      ok: false,
-      error: 'Session not found',
-      details: { session_id: sessionId }
-    });
-  }
-
-  try {
-    if (session.browser) {
-      await session.browser.close();
-    }
-    const sessionPath = await getSessionPath(sessionId);
-    await fs.unlink(sessionPath).catch(() => {});
-    sessions.delete(sessionId);
-
-    return res.status(200).json({
-      ok: true,
-      message: 'Session deleted',
-      session_id: sessionId
-    });
-  } catch (err) {
-    return res.status(500).json({
-      ok: false,
-      error: err.message,
-      details: { session_id: sessionId }
-    });
-  }
-});
-
 app.delete('/sessions/all', async (req, res) => {
   let deleted = 0;
   let errors = 0;
@@ -343,6 +324,40 @@ app.delete('/sessions/all', async (req, res) => {
       ok: false,
       error: err.message,
       details: { deleted, errors }
+    });
+  }
+});
+
+app.delete('/sessions/:session_id', async (req, res) => {
+  const sessionId = req.params.session_id;
+  const session = sessions.get(sessionId);
+
+  if (!session) {
+    return res.status(404).json({
+      ok: false,
+      error: 'Session not found',
+      details: { session_id: sessionId }
+    });
+  }
+
+  try {
+    if (session.browser) {
+      await session.browser.close();
+    }
+    const sessionPath = await getSessionPath(sessionId);
+    await fs.unlink(sessionPath).catch(() => {});
+    sessions.delete(sessionId);
+
+    return res.status(200).json({
+      ok: true,
+      message: 'Session deleted',
+      session_id: sessionId
+    });
+  } catch (err) {
+    return res.status(500).json({
+      ok: false,
+      error: err.message,
+      details: { session_id: sessionId }
     });
   }
 });
