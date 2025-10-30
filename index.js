@@ -58,6 +58,13 @@ async function tryClick(page, selectors) {
   return false;
 }
 
+async function waitForAnySelector(page, selectors, timeoutPer = 5000) {
+  for (const sel of selectors) {
+    try { await page.waitForSelector(sel, { timeout: timeoutPer }); return sel; } catch (_) {}
+  }
+  return null;
+}
+
 async function ensureTmpDir() {
   const dir = path.join('/tmp', 'pwc');
   try {
@@ -189,55 +196,26 @@ app.post('/start-login', async (req, res) => {
       ]);
     } catch (_) {}
 
-    let otpSelector = null;
-    try {
-      await page.waitForSelector('input[name="callback_2"]', { timeout: 30000 });
-      otpSelector = 'input[name="callback_2"]';
-    } catch {
-      try {
-        await page.waitForSelector('input[name="otp"]', { timeout: 5000 });
-        otpSelector = 'input[name="otp"]';
-      } catch {
-        try {
-          await page.waitForSelector('input[id*="otp"]', { timeout: 5000 });
-          otpSelector = 'input[id*="otp"]';
-        } catch (err) {
-          try {
-            await page.waitForSelector('input[placeholder*="verification" i]', { timeout: 5000 });
-            otpSelector = 'input[placeholder*="verification" i]';
-          } catch (e2) {
-            try {
-              await page.waitForSelector('input[type="tel"]', { timeout: 5000 });
-              otpSelector = 'input[type="tel"]';
-            } catch (e3) {
-              try {
-                await page.waitForSelector('input[name*="code" i]', { timeout: 5000 });
-                otpSelector = 'input[name*="code" i]';
-              } catch (e4) {
-                try {
-                  await page.waitForSelector('input[id*="code" i]', { timeout: 5000 });
-                  otpSelector = 'input[id*="code" i]';
-                } catch (e5) {
-                  try {
-                    await page.waitForSelector('input[name*="verification" i], input[id*="verification" i], input[aria-label*="verification" i], input[aria-label*="one-time" i]', { timeout: 5000 });
-                    otpSelector = 'input[name*="verification" i], input[id*="verification" i], input[aria-label*="verification" i], input[aria-label*="one-time" i]';
-                  } catch (e6) {
-                    try {
-                      await page.waitForSelector('text="Resend Code"', { timeout: 2000 });
-                    } catch (_) {}
-                    await browser.close();
-                    return res.status(500).json({
-                      ok: false,
-                      error: 'OTP field not found',
-                      details: { step: 'otp:input' }
-                    });
-                  }
-                }
-              }
-            }
-          }
-        }
-      }
+    let otpSelector = await waitForAnySelector(page, [
+      'input[placeholder="One-time verification code"]',
+      'input[aria-label="One-time verification code"]',
+      'input[name="callback_2"]',
+      'input[name="otp"]',
+      'input[id*="otp"]',
+      'input[placeholder*="verification" i]',
+      'input[type="tel"]',
+      'input[name*="code" i]',
+      'input[id*="code" i]',
+      'input[name*="verification" i], input[id*="verification" i], input[aria-label*="verification" i], input[aria-label*="one-time" i]'
+    ], 7000);
+    if (!otpSelector) {
+      try { await page.waitForSelector('text="Resend Code"', { timeout: 2000 }); } catch (_) {}
+      await browser.close();
+      return res.status(500).json({
+        ok: false,
+        error: 'OTP field not found',
+        details: { step: 'otp:input' }
+      });
     }
 
     const sessionPath = await getSessionPath(sessionId);
