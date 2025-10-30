@@ -132,6 +132,22 @@ app.post('/start-login', async (req, res) => {
       await page.click('input[type="submit"]');
     }
 
+    try {
+      await page.waitForTimeout(500);
+      try { await page.check('input[type="radio"][value*="email" i]'); } catch {}
+      try { await page.click('label:has-text("Email me at")'); } catch {}
+      try { await page.click('text=Email me at'); } catch {}
+      try { await page.click('text=Email'); } catch {}
+      try { await page.click('text=E-mail'); } catch {}
+      try { await page.click('button:has-text("Send my code")'); } catch {}
+      try { await page.click('button:has-text("Email me a code")'); } catch {}
+      try { await page.click('button:has-text("Send code")'); } catch {}
+      try { await page.click('button:has-text("Send verification code")'); } catch {}
+      try { await page.click('button:has-text("Continue")'); } catch {}
+      try { await page.click('button:has-text("Next")'); } catch {}
+      try { await page.click('input[type="submit"][value*="Email" i]'); } catch {}
+    } catch {}
+
     let otpSelector = null;
     try {
       await page.waitForSelector('input[name="callback_2"]', { timeout: 30000 });
@@ -145,12 +161,17 @@ app.post('/start-login', async (req, res) => {
           await page.waitForSelector('input[id*="otp"]', { timeout: 5000 });
           otpSelector = 'input[id*="otp"]';
         } catch (err) {
-          await browser.close();
-          return res.status(500).json({
-            ok: false,
-            error: 'OTP field not found',
-            details: { step: 'start-login' }
-          });
+          try {
+            await page.waitForSelector('input[placeholder*="verification" i]', { timeout: 5000 });
+            otpSelector = 'input[placeholder*="verification" i]';
+          } catch (e2) {
+            await browser.close();
+            return res.status(500).json({
+              ok: false,
+              error: 'OTP field not found',
+              details: { step: 'start-login' }
+            });
+          }
         }
       }
     }
@@ -390,17 +411,51 @@ app.get('/health', (req, res) => {
   });
 });
 
-app.post('/zapier-start-login', async (req, res) => {
-  res.status(200).json({ ok: true, message: 'Login queued' });
+const tickets = new Map();
+
+function queueJob(run) {
+  const id = uuidv4();
+  tickets.set(id, { status: 'queued' });
   setImmediate(async () => {
     try {
-      await fetch(`http://localhost:${PORT}/start-login`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({})
-      });
-    } catch (_) {}
+      const result = await run();
+      tickets.set(id, { status: 'done', result });
+    } catch (err) {
+      tickets.set(id, { status: 'error', error: String(err && err.message ? err.message : err) });
+    }
   });
+  return id;
+}
+
+app.post('/zapier-start-login', async (req, res) => {
+  const ticket_id = queueJob(async () => {
+    const r = await fetch(`http://localhost:${PORT}/start-login`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({})
+    });
+    return await r.json();
+  });
+  res.status(200).json({ ok: true, message: 'Login queued', ticket_id });
+});
+
+app.post('/zapier-complete-login', async (req, res) => {
+  const { session_id, otp } = req.body || {};
+  const ticket_id = queueJob(async () => {
+    const r = await fetch(`http://localhost:${PORT}/complete-login`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ session_id, otp })
+    });
+    return await r.json();
+  });
+  res.status(200).json({ ok: true, message: 'Completion queued', ticket_id });
+});
+
+app.get('/status/:ticket_id', (req, res) => {
+  const t = tickets.get(req.params.ticket_id);
+  if (!t) return res.status(404).json({ ok: false, error: 'Unknown ticket' });
+  return res.status(200).json({ ok: true, ...t });
 });
 
 app.listen(PORT, '0.0.0.0', () => {});
