@@ -1,0 +1,16 @@
+run = "npm start"
+entrypoint = "index.js"
+
+[nix]
+channel = "stable-22_11"
+
+[deployment]
+run = ["sh", "-c", "npm start"]
+deploymentTarget = "cloudrun"
+
+[languages.javascript]
+pattern = "**/*.{js,jsx,ts,tsx}"
+
+[languages.javascript.languageServer]
+start = "typescript-language-server --stdio"
+

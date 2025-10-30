@@ -1,0 +1,9 @@
+node_modules/
+.env
+tmp/
+*.json
+!package.json
+!replit.yaml
+*.log
+.DS_Store
+

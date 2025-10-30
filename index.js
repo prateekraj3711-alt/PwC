@@ -1,0 +1,358 @@
+const express = require('express');
+const { chromium } = require('playwright');
+const { v4: uuidv4 } = require('uuid');
+const fs = require('fs').promises;
+const path = require('path');
+require('dotenv').config();
+
+const app = express();
+app.use(express.json());
+
+const PORT = process.env.PORT || 3000;
+const PWC_EMAIL = process.env.PWC_EMAIL;
+const PWC_PASSWORD = process.env.PWC_PASSWORD;
+const SESSION_TTL = 5 * 60 * 1000;
+const CLEANUP_INTERVAL = 60 * 1000;
+
+const sessions = new Map();
+const startTime = Date.now();
+
+async function ensureTmpDir() {
+  const dir = path.join('/tmp', 'pwc');
+  try {
+    await fs.mkdir(dir, { recursive: true });
+  } catch (err) {
+    const dir = path.join(__dirname, 'tmp', 'pwc');
+    await fs.mkdir(dir, { recursive: true });
+    return dir;
+  }
+  return dir;
+}
+
+async function getSessionPath(sessionId) {
+  const baseDir = await ensureTmpDir();
+  return path.join(baseDir, `${sessionId}.json`);
+}
+
+async function cleanupExpiredSessions() {
+  const now = Date.now();
+  for (const [sessionId, session] of sessions.entries()) {
+    if (session.expiry < now) {
+      try {
+        if (session.browser) {
+          await session.browser.close();
+        }
+        const sessionPath = await getSessionPath(sessionId);
+        await fs.unlink(sessionPath).catch(() => {});
+        sessions.delete(sessionId);
+      } catch (err) {
+        sessions.delete(sessionId);
+      }
+    }
+  }
+}
+
+setInterval(cleanupExpiredSessions, CLEANUP_INTERVAL);
+
+app.post('/start-login', async (req, res) => {
+  let browser = null;
+  try {
+    if (!PWC_EMAIL || !PWC_PASSWORD) {
+      return res.status(400).json({
+        ok: false,
+        error: 'Missing credentials',
+        details: { step: 'start-login' }
+      });
+    }
+
+    const sessionId = uuidv4();
+    browser = await chromium.launch({ 
+      headless: true,
+      args: ['--no-sandbox', '--disable-setuid-sandbox']
+    });
+    const context = await browser.newContext();
+    const page = await context.newPage();
+
+    await page.goto('https://login.pwc.com/login/?goto=https:%2F%2Flogin.pwc.com:443%2Fopenam%2Foauth2%2Fauthorize%3Fresponse_type%3Dcode%26client_id%3Durn%253Acompliancenominationportal.in.pwc.com%26redirect_uri%3Dhttps%253A%252F%252Fcompliancenominationportal.in.pwc.com%26scope%3Dopenid%26state%3Ddemo&realm=%2Fpwc');
+
+    try {
+      await page.fill('input[name="callback_0"]', PWC_EMAIL);
+    } catch {
+      await page.fill('input[type="email"]', PWC_EMAIL);
+    }
+
+    try {
+      await page.fill('input[name="callback_1"]', PWC_PASSWORD);
+    } catch {
+      await page.fill('input[type="password"]', PWC_PASSWORD);
+    }
+
+    try {
+      await page.click('button[type="submit"]');
+    } catch {
+      await page.click('input[type="submit"]');
+    }
+
+    let otpSelector = null;
+    try {
+      await page.waitForSelector('input[name="callback_2"]', { timeout: 30000 });
+      otpSelector = 'input[name="callback_2"]';
+    } catch {
+      try {
+        await page.waitForSelector('input[name="otp"]', { timeout: 5000 });
+        otpSelector = 'input[name="otp"]';
+      } catch {
+        try {
+          await page.waitForSelector('input[id*="otp"]', { timeout: 5000 });
+          otpSelector = 'input[id*="otp"]';
+        } catch (err) {
+          await browser.close();
+          return res.status(500).json({
+            ok: false,
+            error: 'OTP field not found',
+            details: { step: 'start-login' }
+          });
+        }
+      }
+    }
+
+    const sessionPath = await getSessionPath(sessionId);
+    const storageState = await context.storageState();
+    await fs.writeFile(sessionPath, JSON.stringify(storageState));
+
+    sessions.set(sessionId, {
+      browser,
+      context,
+      page,
+      expiry: Date.now() + SESSION_TTL
+    });
+
+    return res.status(200).json({
+      ok: true,
+      session_id: sessionId,
+      message: 'Awaiting OTP'
+    });
+
+  } catch (err) {
+    if (browser) {
+      await browser.close().catch(() => {});
+    }
+    return res.status(500).json({
+      ok: false,
+      error: err.message,
+      details: { step: 'start-login' }
+    });
+  }
+});
+
+app.post('/complete-login', async (req, res) => {
+  let browser = null;
+  try {
+    const { session_id, otp } = req.body;
+
+    if (!session_id || !otp) {
+      return res.status(400).json({
+        ok: false,
+        error: 'Missing session_id or otp',
+        details: { step: 'OTP' }
+      });
+    }
+
+    let session = sessions.get(session_id);
+    
+    if (!session) {
+      const sessionPath = await getSessionPath(session_id);
+      try {
+        const storageStateData = await fs.readFile(sessionPath, 'utf-8');
+        const storageState = JSON.parse(storageStateData);
+        
+        browser = await chromium.launch({ 
+          headless: true,
+          args: ['--no-sandbox', '--disable-setuid-sandbox']
+        });
+        const context = await browser.newContext({ storageState });
+        const page = await context.newPage();
+        
+        await page.goto('https://login.pwc.com/login/?goto=https:%2F%2Flogin.pwc.com:443%2Fopenam%2Foauth2%2Fauthorize%3Fresponse_type%3Dcode%26client_id%3Durn%253Acompliancenominationportal.in.pwc.com%26redirect_uri%3Dhttps%253A%252F%252Fcompliancenominationportal.in.pwc.com%26scope%3Dopenid%26state%3Ddemo&realm=%2Fpwc');
+        
+        session = { browser, context, page, expiry: Date.now() + SESSION_TTL };
+        sessions.set(session_id, session);
+      } catch (err) {
+        return res.status(400).json({
+          ok: false,
+          error: 'Session not found',
+          details: { step: 'OTP' }
+        });
+      }
+    } else {
+      browser = session.browser;
+    }
+
+    const { page, context } = session;
+
+    try {
+      await page.fill('input[name="callback_2"]', otp);
+    } catch {
+      try {
+        await page.fill('input[name="otp"]', otp);
+      } catch {
+        await page.fill('input[id*="otp"]', otp);
+      }
+    }
+
+    try {
+      await page.click('button[type="submit"]');
+    } catch {
+      await page.click('input[type="submit"]');
+    }
+
+    await page.waitForLoadState('networkidle', { timeout: 30000 });
+
+    const currentUrl = page.url();
+    let loginSuccess = false;
+
+    if (currentUrl.includes('compliancenomination')) {
+      try {
+        await page.waitForSelector('table', { timeout: 10000 });
+        loginSuccess = true;
+      } catch {
+        try {
+          await page.waitForSelector('#dashboard', { timeout: 2000 });
+          loginSuccess = true;
+        } catch {
+          try {
+            await page.waitForSelector('text="Background Verification"', { timeout: 2000 });
+            loginSuccess = true;
+          } catch (err) {
+            loginSuccess = false;
+          }
+        }
+      }
+    }
+
+    if (!loginSuccess) {
+      await browser.close();
+      sessions.delete(session_id);
+      await fs.unlink(await getSessionPath(session_id)).catch(() => {});
+      return res.status(500).json({
+        ok: false,
+        error: 'Login incomplete',
+        details: { step: 'OTP' }
+      });
+    }
+
+    const cookies = await context.cookies();
+    const screenshot = await page.screenshot({ type: 'png' });
+    const screenshot_base64 = screenshot.toString('base64');
+
+    await browser.close();
+    sessions.delete(session_id);
+    await fs.unlink(await getSessionPath(session_id)).catch(() => {});
+
+    return res.status(200).json({
+      ok: true,
+      message: 'Login complete',
+      cookies,
+      screenshot_base64
+    });
+
+  } catch (err) {
+    if (browser) {
+      await browser.close().catch(() => {});
+    }
+    return res.status(500).json({
+      ok: false,
+      error: err.message,
+      details: { step: 'OTP' }
+    });
+  }
+});
+
+app.delete('/sessions/:session_id', async (req, res) => {
+  const sessionId = req.params.session_id;
+  const session = sessions.get(sessionId);
+
+  if (!session) {
+    return res.status(404).json({
+      ok: false,
+      error: 'Session not found',
+      details: { session_id: sessionId }
+    });
+  }
+
+  try {
+    if (session.browser) {
+      await session.browser.close();
+    }
+    const sessionPath = await getSessionPath(sessionId);
+    await fs.unlink(sessionPath).catch(() => {});
+    sessions.delete(sessionId);
+
+    return res.status(200).json({
+      ok: true,
+      message: 'Session deleted',
+      session_id: sessionId
+    });
+  } catch (err) {
+    return res.status(500).json({
+      ok: false,
+      error: err.message,
+      details: { session_id: sessionId }
+    });
+  }
+});
+
+app.delete('/sessions/all', async (req, res) => {
+  let deleted = 0;
+  let errors = 0;
+  
+  try {
+    for (const [sessionId, session] of sessions.entries()) {
+      try {
+        if (session.browser) {
+          await session.browser.close();
+        }
+        const sessionPath = await getSessionPath(sessionId);
+        await fs.unlink(sessionPath).catch(() => {});
+        sessions.delete(sessionId);
+        deleted++;
+      } catch (err) {
+        errors++;
+      }
+    }
+
+    try {
+      const baseDir = await ensureTmpDir();
+      const files = await fs.readdir(baseDir);
+      for (const file of files) {
+        if (file.endsWith('.json')) {
+          await fs.unlink(path.join(baseDir, file)).catch(() => {});
+        }
+      }
+    } catch (err) {
+    }
+
+    return res.status(200).json({
+      ok: true,
+      message: 'All sessions deleted',
+      deleted,
+      errors
+    });
+  } catch (err) {
+    return res.status(500).json({
+      ok: false,
+      error: err.message,
+      details: { deleted, errors }
+    });
+  }
+});
+
+app.get('/health', (req, res) => {
+  return res.status(200).json({
+    ok: true,
+    uptime: Date.now() - startTime
+  });
+});
+
+app.listen(PORT, () => {});
+
