@@ -1,8 +1,9 @@
+modules = ["nodejs-20"]
 run = "npm start"
 entrypoint = "index.js"
 
 [nix]
-channel = "stable-22_11"
+channel = "stable-23_11"
 
 [deployment]
 run = ["sh", "-c", "npm start"]
