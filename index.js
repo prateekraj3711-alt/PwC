@@ -196,19 +196,12 @@ app.post('/start-login', async (req, res) => {
       ]);
     } catch (_) {}
 
-    let otpSelector = await waitForAnySelector(page, [
-      'input[placeholder="One-time verification code"]',
-      'input[aria-label="One-time verification code"]',
-      'input[name="callback_2"]',
-      'input[name="otp"]',
-      'input[id*="otp"]',
-      'input[placeholder*="verification" i]',
-      'input[type="tel"]',
-      'input[name*="code" i]',
-      'input[id*="code" i]',
-      'input[name*="verification" i], input[id*="verification" i], input[aria-label*="verification" i], input[aria-label*="one-time" i]'
-    ], 7000);
-    if (!otpSelector) {
+    const otpLocator = page.locator(
+      'input[placeholder="One-time verification code"], input[aria-label="One-time verification code"], input[autocomplete="one-time-code"], input[type="text"][inputmode="numeric" i], input[type="tel"], input[name="callback_2"], input[name="otp"], input[id*="otp" i], input[placeholder*="verification" i], input[name*="code" i], input[id*="code" i], input[name*="verification" i], input[id*="verification" i], input[aria-label*="verification" i], input[aria-label*="one-time" i]'
+    ).first();
+    try {
+      await otpLocator.waitFor({ state: 'visible', timeout: 30000 });
+    } catch (_) {
       try { await page.waitForSelector('text="Resend Code"', { timeout: 2000 }); } catch (_) {}
       await browser.close();
       return res.status(500).json({
@@ -291,19 +284,22 @@ app.post('/complete-login', async (req, res) => {
     const { page, context } = session;
 
     try {
-      await page.fill('input[name="callback_2"]', otp);
+      const otpInput = page.locator(
+        'input[placeholder="One-time verification code"], input[aria-label="One-time verification code"], input[autocomplete="one-time-code"], input[type="text"][inputmode="numeric" i], input[type="tel"], input[name="callback_2"], input[name="otp"], input[id*="otp" i], input[placeholder*="verification" i], input[name*="code" i], input[id*="code" i], input[name*="verification" i], input[id*="verification" i], input[aria-label*="verification" i], input[aria-label*="one-time" i]'
+      ).first();
+      await otpInput.waitFor({ state: 'visible', timeout: 30000 });
+      await otpInput.fill(otp);
     } catch {
-      try {
-        await page.fill('input[name="otp"]', otp);
-      } catch {
-        await page.fill('input[id*="otp"]', otp);
-      }
+      try { await page.fill('input[name="callback_2"]', otp); } catch {}
+      try { await page.fill('input[name="otp"]', otp); } catch {}
+      try { await page.fill('input[id*="otp"]', otp); } catch {}
     }
 
     try {
       await page.click('button[type="submit"]');
     } catch {
-      await page.click('input[type="submit"]');
+      try { await page.click('input[type="submit"]'); } catch {}
+      try { await page.click('button:has-text("Submit")'); } catch {}
     }
 
     await page.waitForLoadState('networkidle', { timeout: 30000 });
