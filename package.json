@@ -4,7 +4,8 @@
   "description": "PwC portal login automation with OTP for Zapier integration",
   "main": "index.js",
   "scripts": {
-    "start": "node index.js"
+    "start": "node index.js",
+    "postinstall": "npx playwright install --with-deps chromium"
   },
   "dependencies": {
     "express": "^4.18.2",
