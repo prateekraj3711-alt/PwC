@@ -15,6 +15,7 @@ const SESSION_TTL = 5 * 60 * 1000;
 const CLEANUP_INTERVAL = 60 * 1000;
 
 const sessions = new Map();
+let latestSessionId = null;
 const startTime = Date.now();
 
 function chromiumLaunchOptions() {
@@ -258,10 +259,11 @@ app.post('/complete-login', async (req, res) => {
       });
     }
 
-    let session = sessions.get(session_id);
+    let effectiveSessionId = session_id || latestSessionId;
+    let session = sessions.get(effectiveSessionId);
     
     if (!session) {
-      const sessionPath = await getSessionPath(session_id);
+      const sessionPath = await getSessionPath(effectiveSessionId);
       try {
         const storageStateData = await fs.readFile(sessionPath, 'utf-8');
         const storageState = JSON.parse(storageStateData);
@@ -273,7 +275,7 @@ app.post('/complete-login', async (req, res) => {
         await page.goto('https://login.pwc.com/login/?goto=https:%2F%2Flogin.pwc.com:443%2Fopenam%2Foauth2%2Fauthorize%3Fresponse_type%3Dcode%26client_id%3Durn%253Acompliancenominationportal.in.pwc.com%26redirect_uri%3Dhttps%253A%252F%252Fcompliancenominationportal.in.pwc.com%26scope%3Dopenid%26state%3Ddemo&realm=%2Fpwc');
         
         session = { browser, context, page, expiry: Date.now() + SESSION_TTL };
-        sessions.set(session_id, session);
+        sessions.set(effectiveSessionId, session);
       } catch (err) {
         return res.status(400).json({
           ok: false,
@@ -329,8 +331,8 @@ app.post('/complete-login', async (req, res) => {
 
     if (!loginSuccess) {
       await browser.close();
-      sessions.delete(session_id);
-      await fs.unlink(await getSessionPath(session_id)).catch(() => {});
+      sessions.delete(effectiveSessionId);
+      await fs.unlink(await getSessionPath(effectiveSessionId)).catch(() => {});
       return res.status(500).json({
         ok: false,
         error: 'Login incomplete',
@@ -343,8 +345,8 @@ app.post('/complete-login', async (req, res) => {
     const screenshot_base64 = screenshot.toString('base64');
 
     await browser.close();
-    sessions.delete(session_id);
-    await fs.unlink(await getSessionPath(session_id)).catch(() => {});
+    sessions.delete(effectiveSessionId);
+    await fs.unlink(await getSessionPath(effectiveSessionId)).catch(() => {});
 
     return res.status(200).json({
       ok: true,
@@ -451,6 +453,11 @@ app.get('/health', (req, res) => {
   });
 });
 
+app.get('/session/latest', (req, res) => {
+  if (!latestSessionId) return res.status(404).json({ ok: false, error: 'No session yet' });
+  return res.status(200).json({ ok: true, session_id: latestSessionId });
+});
+
 const tickets = new Map();
 
 function queueJob(run) {
@@ -474,7 +481,9 @@ app.post('/zapier-start-login', async (req, res) => {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({})
     });
-    return await r.json();
+    const out = await r.json();
+    if (out && out.session_id) latestSessionId = out.session_id;
+    return out;
   });
   res.status(200).json({ ok: true, message: 'Login queued', ticket_id });
 });
@@ -499,4 +508,38 @@ app.get('/status/:ticket_id', (req, res) => {
 });
 
 app.listen(PORT, '0.0.0.0', () => {});
+
+// Scheduler: auto-trigger start-login periodically
+let scheduleTimer = null;
+function startScheduler() {
+  const minutes = Number(process.env.SCHEDULE_INTERVAL_MIN || 105);
+  const ms = Math.max(1, minutes) * 60 * 1000;
+  if (scheduleTimer) clearInterval(scheduleTimer);
+  scheduleTimer = setInterval(async () => {
+    try {
+      const r = await fetch(`http://localhost:${PORT}/start-login`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({})
+      });
+      const out = await r.json().catch(() => null);
+      if (out && out.session_id) latestSessionId = out.session_id;
+    } catch (_) {}
+  }, ms);
+}
+
+if (String(process.env.SCHEDULE_ENABLED).toLowerCase() === 'true') {
+  startScheduler();
+}
+
+app.post('/schedule/start', (req, res) => {
+  startScheduler();
+  res.status(200).json({ ok: true, running: true });
+});
+
+app.post('/schedule/stop', (req, res) => {
+  if (scheduleTimer) clearInterval(scheduleTimer);
+  scheduleTimer = null;
+  res.status(200).json({ ok: true, running: false });
+});
 
