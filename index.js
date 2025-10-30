@@ -66,20 +66,85 @@ async function waitForAnySelector(page, selectors, timeoutPer = 5000) {
 }
 
 async function findOtpInputInAllFrames(page, totalTimeoutMs = 30000) {
-  const end = Date.now() + totalTimeoutMs;
-  const selectorCombined = 'input[placeholder*="One-time verification code" i], input[aria-label*="One-time verification code" i], input[autocomplete="one-time-code"], input[type="text"][inputmode="numeric" i], input[type="tel"], input[name="callback_2"], input[name*="otp" i], input[id*="otp" i], input[placeholder*="verification" i], input[name*="code" i], input[id*="code" i], input[name*="verification" i], input[id*="verification" i], input[aria-label*="verification" i], input[aria-label*="one-time" i]';
-  while (Date.now() < end) {
-    const frames = page.frames();
-    for (const fr of frames) {
+  const otpSelectors = [
+    'input[placeholder="One-time verification code"]',
+    'input[aria-label="One-time verification code"]',
+    'input[autocomplete="one-time-code"]',
+    'input[type="text"][inputmode="numeric"]',
+    'input[type="tel"]',
+    'input[name="callback_2"]',
+    'input[name*="otp" i]',
+    'input[id*="otp" i]',
+    'input[name*="code" i]',
+    'input[id*="code" i]',
+    'input[aria-label*="verification" i]',
+    'input[aria-label*="one-time" i]',
+    'input[placeholder*="verification" i]',
+    'input[type="text"]',
+    'input[type="tel"]'
+  ];
+
+  const submitSelectors = [
+    'button:has-text("Send my code")',
+    'button:has-text("Email me a code")',
+    'button:has-text("Send code")',
+    'button:has-text("Send verification code")',
+    'button:has-text("Submit")',
+    'button:has-text("Continue")',
+    'button:has-text("Next")',
+    'input[type="submit"]',
+    'button[type="submit"]'
+  ];
+
+  const startTime = Date.now();
+  const allFrames = [page, ...page.frames()];
+  
+  while (Date.now() - startTime < totalTimeoutMs) {
+    for (const frame of allFrames) {
+      for (const selector of otpSelectors) {
+        try {
+          const locator = frame.locator(selector).first();
+          const isVisible = await locator.isVisible({ timeout: 2000 }).catch(() => false);
+          
+          if (isVisible) {
+            const hasSubmit = await Promise.race(
+              submitSelectors.map(s => 
+                frame.locator(s).first().isVisible({ timeout: 1000 }).catch(() => false)
+              )
+            ).catch(() => false);
+            
+            if (hasSubmit) {
+              return { frame, locator };
+            }
+            
+            const hasSubmitAnywhere = await page.locator(submitSelectors.join(', ')).first().isVisible({ timeout: 1000 }).catch(() => false);
+            if (hasSubmitAnywhere || frame === page) {
+              return { frame, locator };
+            }
+          }
+        } catch (e) {
+          continue;
+        }
+      }
+      
       try {
-        let loc = fr.locator('text=One-time verification code').locator('..').locator('input').first();
-        try { await loc.waitFor({ state: 'visible', timeout: 1000 }); return { frame: fr, locator: loc }; } catch (_) {}
-        loc = fr.locator(selectorCombined).first();
-        try { await loc.waitFor({ state: 'visible', timeout: 1000 }); return { frame: fr, locator: loc }; } catch (_) {}
-      } catch (_) {}
+        const labelAnchored = frame.locator('text=/One-time verification code/i').first();
+        const labelExists = await labelAnchored.isVisible({ timeout: 1000 }).catch(() => false);
+        if (labelExists) {
+          const nearbyInput = labelAnchored.locator('..').locator('input').first();
+          const inputVisible = await nearbyInput.isVisible({ timeout: 1000 }).catch(() => false);
+          if (inputVisible) {
+            return { frame, locator: nearbyInput };
+          }
+        }
+      } catch (e) {
+        continue;
+      }
     }
-    await page.waitForTimeout(500);
+    
+    await page.waitForTimeout(1000);
   }
+  
   return null;
 }
 
@@ -127,9 +192,15 @@ app.get('/', (req, res) => {
     endpoints: {
       'POST /start-login': 'Initiate login and wait for OTP',
       'POST /complete-login': 'Complete login with OTP (requires session_id and otp)',
+      'POST /zapier-start-login': 'Queue login asynchronously (returns ticket_id)',
+      'POST /zapier-complete-login': 'Queue OTP completion asynchronously (returns ticket_id)',
+      'GET /status/:ticket_id': 'Check status of async task',
+      'GET /debug/html': 'Get HTML and screenshot of current page (query: ?session_id=...)',
       'DELETE /sessions/all': 'Delete all sessions',
       'DELETE /sessions/:session_id': 'Delete specific session',
-      'GET /health': 'Health check with uptime'
+      'GET /health': 'Health check with uptime',
+      'POST /schedule/start': 'Start background scheduler',
+      'POST /schedule/stop': 'Stop background scheduler'
     },
     version: '1.0.0'
   });
@@ -217,9 +288,14 @@ app.post('/start-login', async (req, res) => {
     const otpInAny = await findOtpInputInAllFrames(page, 30000);
     if (!otpInAny) {
       try { await page.waitForSelector('text="Resend Code"', { timeout: 2000 }); } catch (_) {}
-      const scr = await page.screenshot({ fullPage: true }).catch(() => null);
+      const scr = await page.screenshot({ fullPage: true, type: 'png' }).catch(() => null);
       await browser.close();
-      return res.status(500).json({ ok: false, error: 'OTP field not found', details: { step: 'otp:input' }, screenshot_base64: scr ? scr.toString('base64') : undefined });
+      return res.status(500).json({ 
+        ok: false, 
+        error: 'OTP field not found', 
+        details: { step: 'otp:input', reason: 'Input not visible in any frame after 30s' }, 
+        screenshot_base64: scr ? scr.toString('base64') : undefined 
+      });
     }
 
     const sessionPath = await getSessionPath(sessionId);
@@ -240,13 +316,25 @@ app.post('/start-login', async (req, res) => {
     });
 
   } catch (err) {
+    let screenshot_base64 = undefined;
     if (browser) {
+      try {
+        const contexts = browser.contexts();
+        if (contexts.length > 0) {
+          const pages = await contexts[0].pages();
+          if (pages.length > 0) {
+            const scr = await pages[0].screenshot({ fullPage: true, type: 'png' }).catch(() => null);
+            screenshot_base64 = scr ? scr.toString('base64') : undefined;
+          }
+        }
+      } catch (_) {}
       await browser.close().catch(() => {});
     }
     return res.status(500).json({
       ok: false,
       error: err.message,
-      details: { step: 'start-login' }
+      details: { step: 'start-login' },
+      screenshot_base64
     });
   }
 });
@@ -294,21 +382,73 @@ app.post('/complete-login', async (req, res) => {
 
     const { page, context } = session;
 
+    let found = null;
     try {
-      const found = await findOtpInputInAllFrames(page, 30000);
-      if (!found) throw new Error('otp input not visible');
+      found = await findOtpInputInAllFrames(page, 30000);
+      if (!found) {
+        const scr = await page.screenshot({ fullPage: true, type: 'png' }).catch(() => null);
+        return res.status(500).json({ 
+          ok: false, 
+          error: 'OTP field not found', 
+          details: { step: 'otp:input', reason: 'Input not visible in any frame after 30s' }, 
+          screenshot_base64: scr ? scr.toString('base64') : undefined 
+        });
+      }
+      
       await found.locator.fill(otp);
-      try { await found.frame.locator('button:has-text("Submit")').click(); } catch (_) { await page.locator('button:has-text("Submit")').click().catch(() => {}); }
+      
+      const submitSelectors = [
+        'button:has-text("Submit")',
+        'button:has-text("Continue")',
+        'button:has-text("Verify")',
+        'button[type="submit"]',
+        'input[type="submit"]',
+        'button:has-text("Send my code")',
+        'button:has-text("Email me a code")'
+      ];
+      
+      let submitted = false;
+      for (const sel of submitSelectors) {
+        try {
+          const submitBtn = found.frame.locator(sel).first();
+          if (await submitBtn.isVisible({ timeout: 2000 }).catch(() => false)) {
+            await submitBtn.click();
+            submitted = true;
+            break;
+          }
+        } catch (_) {}
+      }
+      
+      if (!submitted) {
+        for (const sel of submitSelectors) {
+          try {
+            const submitBtn = page.locator(sel).first();
+            if (await submitBtn.isVisible({ timeout: 2000 }).catch(() => false)) {
+              await submitBtn.click();
+              submitted = true;
+              break;
+            }
+          } catch (_) {}
+        }
+      }
+      
+      if (!submitted) {
+        const scr = await page.screenshot({ fullPage: true, type: 'png' }).catch(() => null);
+        return res.status(500).json({ 
+          ok: false, 
+          error: 'Submit button not found', 
+          details: { step: 'otp:submit' }, 
+          screenshot_base64: scr ? scr.toString('base64') : undefined 
+        });
+      }
     } catch (e) {
-      const scr = await page.screenshot({ fullPage: true }).catch(() => null);
-      return res.status(500).json({ ok: false, error: 'OTP field not found', details: { step: 'otp:input', reason: String(e && e.message ? e.message : e) }, screenshot_base64: scr ? scr.toString('base64') : undefined });
-    }
-
-    try {
-      await page.click('button[type="submit"]');
-    } catch {
-      try { await page.click('input[type="submit"]'); } catch {}
-      try { await page.click('button:has-text("Submit")'); } catch {}
+      const scr = await page.screenshot({ fullPage: true, type: 'png' }).catch(() => null);
+      return res.status(500).json({ 
+        ok: false, 
+        error: 'OTP entry failed', 
+        details: { step: 'otp:input', reason: String(e && e.message ? e.message : e) }, 
+        screenshot_base64: scr ? scr.toString('base64') : undefined 
+      });
     }
 
     await page.waitForLoadState('networkidle', { timeout: 30000 });
@@ -362,13 +502,25 @@ app.post('/complete-login', async (req, res) => {
     });
 
   } catch (err) {
+    let screenshot_base64 = undefined;
     if (browser) {
+      try {
+        const contexts = browser.contexts();
+        if (contexts.length > 0) {
+          const pages = await contexts[0].pages();
+          if (pages.length > 0) {
+            const scr = await pages[0].screenshot({ fullPage: true, type: 'png' }).catch(() => null);
+            screenshot_base64 = scr ? scr.toString('base64') : undefined;
+          }
+        }
+      } catch (_) {}
       await browser.close().catch(() => {});
     }
     return res.status(500).json({
       ok: false,
       error: err.message,
-      details: { step: 'OTP' }
+      details: { step: 'OTP' },
+      screenshot_base64
     });
   }
 });
@@ -462,6 +614,37 @@ app.get('/health', (req, res) => {
 app.get('/session/latest', (req, res) => {
   if (!latestSessionId) return res.status(404).json({ ok: false, error: 'No session yet' });
   return res.status(200).json({ ok: true, session_id: latestSessionId });
+});
+
+app.get('/debug/html', async (req, res) => {
+  try {
+    const sessionId = req.query.session_id || latestSessionId;
+    if (!sessionId) {
+      return res.status(404).json({ ok: false, error: 'No active session' });
+    }
+    
+    const session = sessions.get(sessionId);
+    if (!session || !session.page) {
+      return res.status(404).json({ ok: false, error: 'Session not found or page closed' });
+    }
+    
+    const html = await session.page.content();
+    const url = session.page.url();
+    const screenshot = await session.page.screenshot({ fullPage: true, type: 'png' }).catch(() => null);
+    
+    return res.status(200).json({
+      ok: true,
+      url,
+      html,
+      screenshot_base64: screenshot ? screenshot.toString('base64') : undefined
+    });
+  } catch (err) {
+    return res.status(500).json({
+      ok: false,
+      error: err.message,
+      details: { step: 'debug' }
+    });
+  }
 });
 
 const tickets = new Map();
