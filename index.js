@@ -22,9 +22,24 @@ function chromiumLaunchOptions() {
     headless: true,
     args: ['--no-sandbox', '--disable-setuid-sandbox']
   };
-  if (process.env.CHROMIUM_PATH && process.env.CHROMIUM_PATH.trim() !== '') {
-    o.executablePath = process.env.CHROMIUM_PATH;
+  if (!process.env.PLAYWRIGHT_SKIP_VALIDATE_HOST_REQUIREMENTS) {
+    process.env.PLAYWRIGHT_SKIP_VALIDATE_HOST_REQUIREMENTS = '1';
   }
+  try {
+    if (!process.env.CHROMIUM_PATH) {
+      const { execSync } = require('child_process');
+      const found = execSync(
+        'command -v chromium || command -v chromium-browser || command -v google-chrome || true',
+        { encoding: 'utf8' }
+      ).trim();
+      if (found) {
+        process.env.CHROMIUM_PATH = found;
+      }
+    }
+    if (process.env.CHROMIUM_PATH && process.env.CHROMIUM_PATH.trim() !== '') {
+      o.executablePath = process.env.CHROMIUM_PATH.trim();
+    }
+  } catch (_) {}
   return o;
 }
 
@@ -372,6 +387,19 @@ app.get('/health', (req, res) => {
   return res.status(200).json({
     ok: true,
     uptime: Date.now() - startTime
+  });
+});
+
+app.post('/zapier-start-login', async (req, res) => {
+  res.status(200).json({ ok: true, message: 'Login queued' });
+  setImmediate(async () => {
+    try {
+      await fetch(`http://localhost:${PORT}/start-login`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({})
+      });
+    } catch (_) {}
   });
 });
 
