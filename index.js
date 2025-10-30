@@ -138,10 +138,21 @@ app.post('/start-login', async (req, res) => {
       return res.status(500).json({ ok: false, error: 'Email field not found', details: { step: 'login:email' } });
     }
 
+    // Some flows are username-first; advance to password screen if needed
+    await tryClick(page, [
+      'button:has-text("Next")',
+      'button:has-text("Continue")',
+      'input[type="submit"][value*="Next" i]',
+      'input[type="submit"][value*="Continue" i]'
+    ]);
+
     const passFilled = await tryFill(page, [
       'input[name="callback_1"]',
-      'input[type="password"]',
-      'input[name="password" i]'
+      'input[name="IDToken2"]',
+      'input#password',
+      'input[name="password" i]',
+      'input[autocomplete="current-password"]',
+      'input[type="password"]'
     ], PWC_PASSWORD);
     if (!passFilled) {
       await browser.close();
