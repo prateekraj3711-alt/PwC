@@ -43,6 +43,20 @@ function chromiumLaunchOptions() {
   return o;
 }
 
+async function tryFill(page, selectors, value) {
+  for (const sel of selectors) {
+    try { await page.waitForSelector(sel, { timeout: 4000 }); await page.fill(sel, value); return true; } catch (_) {}
+  }
+  return false;
+}
+
+async function tryClick(page, selectors) {
+  for (const sel of selectors) {
+    try { await page.waitForSelector(sel, { timeout: 4000 }); await page.click(sel); return true; } catch (_) {}
+  }
+  return false;
+}
+
 async function ensureTmpDir() {
   const dir = path.join('/tmp', 'pwc');
   try {
@@ -114,39 +128,54 @@ app.post('/start-login', async (req, res) => {
 
     await page.goto(`https://login.pwc.com/login/?goto=https:%2F%2Flogin.pwc.com:443%2Fopenam%2Foauth2%2Fauthorize%3Fresponse_type%3Dcode%26client_id%3Durn%253Acompliancenominationportal.in.pwc.com%26redirect_uri%3Dhttps%253A%252F%252Fcompliancenominationportal.in.pwc.com%26scope%3Dopenid%26state%3D${stateToken}&realm=%2Fpwc`);
 
-    try {
-      await page.fill('input[name="callback_0"]', PWC_EMAIL);
-    } catch {
-      await page.fill('input[type="email"]', PWC_EMAIL);
+    const emailFilled = await tryFill(page, [
+      'input[name="callback_0"]',
+      'input[type="email"]',
+      'input[name="email" i]'
+    ], PWC_EMAIL);
+    if (!emailFilled) {
+      await browser.close();
+      return res.status(500).json({ ok: false, error: 'Email field not found', details: { step: 'login:email' } });
     }
 
-    try {
-      await page.fill('input[name="callback_1"]', PWC_PASSWORD);
-    } catch {
-      await page.fill('input[type="password"]', PWC_PASSWORD);
+    const passFilled = await tryFill(page, [
+      'input[name="callback_1"]',
+      'input[type="password"]',
+      'input[name="password" i]'
+    ], PWC_PASSWORD);
+    if (!passFilled) {
+      await browser.close();
+      return res.status(500).json({ ok: false, error: 'Password field not found', details: { step: 'login:password' } });
     }
 
-    try {
-      await page.click('button[type="submit"]');
-    } catch {
-      await page.click('input[type="submit"]');
+    const submitted = await tryClick(page, [
+      'button[type="submit"]',
+      'input[type="submit"]',
+      'button:has-text("Sign in")',
+      'button:has-text("Log in")'
+    ]);
+    if (!submitted) {
+      await browser.close();
+      return res.status(500).json({ ok: false, error: 'Submit button not found', details: { step: 'login:submit' } });
     }
 
     try {
       await page.waitForTimeout(500);
-      try { await page.check('input[type="radio"][value*="email" i]'); } catch {}
-      try { await page.click('label:has-text("Email me at")'); } catch {}
-      try { await page.click('text=Email me at'); } catch {}
-      try { await page.click('text=Email'); } catch {}
-      try { await page.click('text=E-mail'); } catch {}
-      try { await page.click('button:has-text("Send my code")'); } catch {}
-      try { await page.click('button:has-text("Email me a code")'); } catch {}
-      try { await page.click('button:has-text("Send code")'); } catch {}
-      try { await page.click('button:has-text("Send verification code")'); } catch {}
-      try { await page.click('button:has-text("Continue")'); } catch {}
-      try { await page.click('button:has-text("Next")'); } catch {}
-      try { await page.click('input[type="submit"][value*="Email" i]'); } catch {}
-    } catch {}
+      await tryClick(page, [
+        'label:has-text("Email me at")',
+        'text=Email me at',
+        'input[type="radio"][value*="email" i]'
+      ]);
+      await tryClick(page, [
+        'button:has-text("Send my code")',
+        'button:has-text("Email me a code")',
+        'button:has-text("Send code")',
+        'button:has-text("Send verification code")',
+        'button:has-text("Continue")',
+        'button:has-text("Next")',
+        'input[type="submit"][value*="Email" i]'
+      ]);
+    } catch (_) {}
 
     let otpSelector = null;
     try {
@@ -169,7 +198,7 @@ app.post('/start-login', async (req, res) => {
             return res.status(500).json({
               ok: false,
               error: 'OTP field not found',
-              details: { step: 'start-login' }
+              details: { step: 'otp:input' }
             });
           }
         }
