@@ -1,13 +1,17 @@
 entrypoint = "index.js"
+run = "npm start"
 
 modules = ["nodejs-20"]
+
+[nix]
+channel = "stable-23_11"
 
 [workflows]
 runButton = "Project"
 
 [[workflows.workflow]]
 name = "Project"
-mode = "parallel"
+mode = "sequential"
 author = "agent"
 
 [[workflows.workflow.tasks]]
@@ -32,7 +36,6 @@ agentRequireRestartOnSave = false
 [[workflows.workflow.tasks]]
 task = "shell.exec"
 args = "npm install"
-waitForPort = 3000
 
 [[workflows.workflow]]
 name = "Install Playwright"
