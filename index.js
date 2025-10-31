@@ -17,6 +17,30 @@ const CLEANUP_INTERVAL = 60 * 1000;
 const sessions = new Map();
 let latestSessionId = null;
 const startTime = Date.now();
+let cachedTmpDir = null;
+
+async function ensureTmpDir() {
+  if (cachedTmpDir) return cachedTmpDir;
+  
+  const dirsToTry = [
+    path.join('/tmp', 'pwc'),
+    path.join(__dirname, 'tmp', 'pwc'),
+    path.join(process.cwd(), 'tmp', 'pwc')
+  ];
+  
+  for (const dir of dirsToTry) {
+    try {
+      await fs.mkdir(dir, { recursive: true });
+      await fs.access(dir);
+      cachedTmpDir = dir;
+      return dir;
+    } catch (err) {
+      continue;
+    }
+  }
+  
+  throw new Error('Could not create or access tmp directory');
+}
 
 function chromiumLaunchOptions() {
   const o = {
@@ -148,17 +172,6 @@ async function findOtpInputInAllFrames(page, totalTimeoutMs = 30000) {
   return null;
 }
 
-async function ensureTmpDir() {
-  const dir = path.join('/tmp', 'pwc');
-  try {
-    await fs.mkdir(dir, { recursive: true });
-  } catch (err) {
-    const dir = path.join(__dirname, 'tmp', 'pwc');
-    await fs.mkdir(dir, { recursive: true });
-    return dir;
-  }
-  return dir;
-}
 
 async function getSessionPath(sessionId) {
   const baseDir = await ensureTmpDir();
@@ -457,29 +470,50 @@ app.post('/complete-login', async (req, res) => {
     let session = sessions.get(effectiveSessionId);
     
     if (!session) {
-      const sessionPath = await getSessionPath(effectiveSessionId);
       let sessionLoaded = false;
+      const sessionPathsToTry = [
+        await getSessionPath(effectiveSessionId),
+        path.join('/tmp', 'pwc', `${effectiveSessionId}.json`),
+        path.join(__dirname, 'tmp', 'pwc', `${effectiveSessionId}.json`),
+        path.join(process.cwd(), 'tmp', 'pwc', `${effectiveSessionId}.json`)
+      ];
       
-      try {
-        await fs.access(sessionPath);
-        const storageStateData = await fs.readFile(sessionPath, 'utf-8');
-        const storageState = JSON.parse(storageStateData);
+      for (const sessionPath of sessionPathsToTry) {
+        try {
+          await fs.access(sessionPath);
+          const storageStateData = await fs.readFile(sessionPath, 'utf-8');
+          const storageState = JSON.parse(storageStateData);
         
-        browser = await chromium.launch(chromiumLaunchOptions());
-        const context = await browser.newContext({ storageState });
-        const page = await context.newPage();
-        
-        await page.goto('https://login.pwc.com/login/?goto=https:%2F%2Flogin.pwc.com:443%2Fopenam%2Foauth2%2Fauthorize%3Fresponse_type%3Dcode%26client_id%3Durn%253Acompliancenominationportal.in.pwc.com%26redirect_uri%3Dhttps%253A%252F%252Fcompliancenominationportal.in.pwc.com%26scope%3Dopenid%26state%3Ddemo&realm=%2Fpwc');
-        
-        session = { browser, context, page, expiry: Date.now() + SESSION_TTL };
-        sessions.set(effectiveSessionId, session);
-        sessionLoaded = true;
-      } catch (err) {
+          browser = await chromium.launch(chromiumLaunchOptions());
+          const context = await browser.newContext({ storageState });
+          const page = await context.newPage();
+          
+          await page.goto('https://login.pwc.com/login/?goto=https:%2F%2Flogin.pwc.com:443%2Fopenam%2Foauth2%2Fauthorize%3Fresponse_type%3Dcode%26client_id%3Durn%253Acompliancenominationportal.in.pwc.com%26redirect_uri%3Dhttps%253A%252F%252Fcompliancenominationportal.in.pwc.com%26scope%3Dopenid%26state%3Ddemo&realm=%2Fpwc');
+          
+          await page.waitForLoadState('networkidle', { timeout: 15000 }).catch(() => {});
+          await page.waitForTimeout(3000);
+          
+          try {
+            await findOtpInputInAllFrames(page, 10000);
+          } catch (e) {
+            await page.waitForSelector('input[type="text"], input[type="tel"], input[placeholder*="code" i]', { timeout: 5000 }).catch(() => {});
+          }
+          
+          session = { browser, context, page, expiry: Date.now() + SESSION_TTL };
+          sessions.set(effectiveSessionId, session);
+          sessionLoaded = true;
+          break;
+        } catch (err) {
+          continue;
+        }
+      }
+      
+      if (!sessionLoaded) {
         const baseDir = await ensureTmpDir();
         const sessionFiles = await fs.readdir(baseDir).catch(() => []);
         const jsonFiles = sessionFiles.filter(f => f.endsWith('.json'));
         
-        if (!sessionLoaded && jsonFiles.length > 0) {
+        if (jsonFiles.length > 0) {
           for (const file of jsonFiles) {
             const fileSessionId = file.replace('.json', '');
             try {
@@ -556,40 +590,55 @@ app.post('/complete-login', async (req, res) => {
       }
       
       if (pageClosed) {
-        const sessionPath = await getSessionPath(effectiveSessionId);
-        try {
-          await fs.access(sessionPath);
-          const storageStateData = await fs.readFile(sessionPath, 'utf-8');
-          const storageState = JSON.parse(storageStateData);
-          
-          if (session.browser) {
-            await session.browser.close().catch(() => {});
+        const sessionPathsToTry = [
+          await getSessionPath(effectiveSessionId),
+          path.join('/tmp', 'pwc', `${effectiveSessionId}.json`),
+          path.join(__dirname, 'tmp', 'pwc', `${effectiveSessionId}.json`),
+          path.join(process.cwd(), 'tmp', 'pwc', `${effectiveSessionId}.json`)
+        ];
+        
+        let restored = false;
+        for (const sessionPath of sessionPathsToTry) {
+          try {
+            await fs.access(sessionPath);
+            const storageStateData = await fs.readFile(sessionPath, 'utf-8');
+            const storageState = JSON.parse(storageStateData);
+            
+            if (session.browser) {
+              await session.browser.close().catch(() => {});
+            }
+            
+            browser = await chromium.launch(chromiumLaunchOptions());
+            const context = await browser.newContext({ storageState });
+            const page = await context.newPage();
+            
+            await page.goto('https://login.pwc.com/login/?goto=https:%2F%2Flogin.pwc.com:443%2Fopenam%2Foauth2%2Fauthorize%3Fresponse_type%3Dcode%26client_id%3Durn%253Acompliancenominationportal.in.pwc.com%26redirect_uri%3Dhttps%253A%252F%252Fcompliancenominationportal.in.pwc.com%26scope%3Dopenid%26state%3Ddemo&realm=%2Fpwc');
+            
+            await page.waitForLoadState('networkidle', { timeout: 15000 }).catch(() => {});
+            await page.waitForTimeout(3000);
+            
+            const currentUrlAfterRestore = page.url();
+            const pageText = await page.textContent('body').catch(() => '');
+            
+            if (!pageText.toLowerCase().includes('verification code') && !pageText.toLowerCase().includes('one-time')) {
+              try {
+                const otpInput = await findOtpInputInAllFrames(page, 10000);
+                if (!otpInput) {
+                  await page.waitForSelector('input[type="text"], input[type="tel"], input[placeholder*="code" i]', { timeout: 5000 }).catch(() => {});
+                }
+              } catch (e) {}
+            }
+            
+            session = { browser, context, page, expiry: Date.now() + SESSION_TTL };
+            sessions.set(effectiveSessionId, session);
+            restored = true;
+            break;
+          } catch (restoreErr) {
+            continue;
           }
-          
-          browser = await chromium.launch(chromiumLaunchOptions());
-          const context = await browser.newContext({ storageState });
-          const page = await context.newPage();
-          
-          await page.goto('https://login.pwc.com/login/?goto=https:%2F%2Flogin.pwc.com:443%2Fopenam%2Foauth2%2Fauthorize%3Fresponse_type%3Dcode%26client_id%3Durn%253Acompliancenominationportal.in.pwc.com%26redirect_uri%3Dhttps%253A%252F%252Fcompliancenominationportal.in.pwc.com%26scope%3Dopenid%26state%3Ddemo&realm=%2Fpwc');
-          
-          await page.waitForLoadState('networkidle', { timeout: 15000 }).catch(() => {});
-          await page.waitForTimeout(3000);
-          
-          const currentUrlAfterRestore = page.url();
-          const pageText = await page.textContent('body').catch(() => '');
-          
-          if (!pageText.toLowerCase().includes('verification code') && !pageText.toLowerCase().includes('one-time')) {
-            try {
-              const otpInput = await findOtpInputInAllFrames(page, 10000);
-              if (!otpInput) {
-                await page.waitForSelector('input[type="text"], input[type="tel"], input[placeholder*="code" i]', { timeout: 5000 }).catch(() => {});
-              }
-            } catch (e) {}
-          }
-          
-          session = { browser, context, page, expiry: Date.now() + SESSION_TTL };
-          sessions.set(effectiveSessionId, session);
-        } catch (restoreErr) {
+        }
+        
+        if (!restored) {
           sessions.delete(effectiveSessionId);
           return res.status(400).json({
             ok: false,
