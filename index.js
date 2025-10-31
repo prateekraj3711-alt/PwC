@@ -493,6 +493,15 @@ app.post('/complete-login', async (req, res) => {
               
               await page.goto('https://login.pwc.com/login/?goto=https:%2F%2Flogin.pwc.com:443%2Fopenam%2Foauth2%2Fauthorize%3Fresponse_type%3Dcode%26client_id%3Durn%253Acompliancenominationportal.in.pwc.com%26redirect_uri%3Dhttps%253A%252F%252Fcompliancenominationportal.in.pwc.com%26scope%3Dopenid%26state%3Ddemo&realm=%2Fpwc');
               
+              await page.waitForLoadState('networkidle', { timeout: 15000 }).catch(() => {});
+              await page.waitForTimeout(3000);
+              
+              try {
+                await findOtpInputInAllFrames(page, 10000);
+              } catch (e) {
+                await page.waitForSelector('input[type="text"], input[type="tel"], input[placeholder*="code" i]', { timeout: 5000 }).catch(() => {});
+              }
+              
               session = { browser, context, page, expiry: Date.now() + SESSION_TTL };
               sessions.set(fileSessionId, session);
               effectiveSessionId = fileSessionId;
@@ -597,6 +606,9 @@ app.post('/complete-login', async (req, res) => {
     }
 
     const { page, context } = session;
+
+    await page.waitForLoadState('networkidle', { timeout: 10000 }).catch(() => {});
+    await page.waitForTimeout(2000);
 
     let found = null;
     try {
