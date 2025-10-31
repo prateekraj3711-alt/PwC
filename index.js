@@ -11,7 +11,7 @@ app.use(express.json());
 const PORT = process.env.PORT || 3000;
 const PWC_EMAIL = process.env.PWC_EMAIL;
 const PWC_PASSWORD = process.env.PWC_PASSWORD;
-const SESSION_TTL = 5 * 60 * 1000;
+const SESSION_TTL = 15 * 60 * 1000;
 const CLEANUP_INTERVAL = 60 * 1000;
 
 const sessions = new Map();
@@ -375,7 +375,16 @@ app.post('/start-login', async (req, res) => {
 
     const sessionPath = await getSessionPath(sessionId);
     const storageState = await context.storageState();
-    await fs.writeFile(sessionPath, JSON.stringify(storageState));
+    
+    try {
+      await fs.writeFile(sessionPath, JSON.stringify(storageState), 'utf-8');
+    } catch (saveErr) {
+      return res.status(500).json({
+        ok: false,
+        error: 'Failed to save session',
+        details: { step: 'start-login', error: saveErr.message }
+      });
+    }
 
     sessions.set(sessionId, {
       browser,
@@ -383,6 +392,8 @@ app.post('/start-login', async (req, res) => {
       page,
       expiry: Date.now() + SESSION_TTL
     });
+    
+    latestSessionId = sessionId;
 
     return res.status(200).json({
       ok: true,
@@ -430,17 +441,27 @@ app.post('/complete-login', async (req, res) => {
     let effectiveSessionId = session_id || latestSessionId;
     
     if (!effectiveSessionId) {
+      const activeSessions = Array.from(sessions.keys());
       return res.status(400).json({
         ok: false,
         error: 'No active session. Please start login first.',
-        details: { step: 'OTP' }
+        details: { 
+          step: 'OTP',
+          latest_session_id: latestSessionId,
+          active_sessions_count: activeSessions.length,
+          hint: 'The scheduler should automatically create a session. Check if SCHEDULE_ENABLED=true is set.'
+        }
       });
     }
+    
     let session = sessions.get(effectiveSessionId);
     
     if (!session) {
       const sessionPath = await getSessionPath(effectiveSessionId);
+      let sessionLoaded = false;
+      
       try {
+        await fs.access(sessionPath);
         const storageStateData = await fs.readFile(sessionPath, 'utf-8');
         const storageState = JSON.parse(storageStateData);
         
@@ -452,15 +473,127 @@ app.post('/complete-login', async (req, res) => {
         
         session = { browser, context, page, expiry: Date.now() + SESSION_TTL };
         sessions.set(effectiveSessionId, session);
+        sessionLoaded = true;
       } catch (err) {
-        return res.status(400).json({
-          ok: false,
-          error: 'Session not found',
-          details: { step: 'OTP' }
-        });
+        const baseDir = await ensureTmpDir();
+        const sessionFiles = await fs.readdir(baseDir).catch(() => []);
+        const jsonFiles = sessionFiles.filter(f => f.endsWith('.json'));
+        
+        if (!sessionLoaded && jsonFiles.length > 0) {
+          for (const file of jsonFiles) {
+            const fileSessionId = file.replace('.json', '');
+            try {
+              const filePath = path.join(baseDir, file);
+              const storageStateData = await fs.readFile(filePath, 'utf-8');
+              const storageState = JSON.parse(storageStateData);
+              
+              browser = await chromium.launch(chromiumLaunchOptions());
+              const context = await browser.newContext({ storageState });
+              const page = await context.newPage();
+              
+              await page.goto('https://login.pwc.com/login/?goto=https:%2F%2Flogin.pwc.com:443%2Fopenam%2Foauth2%2Fauthorize%3Fresponse_type%3Dcode%26client_id%3Durn%253Acompliancenominationportal.in.pwc.com%26redirect_uri%3Dhttps%253A%252F%252Fcompliancenominationportal.in.pwc.com%26scope%3Dopenid%26state%3Ddemo&realm=%2Fpwc');
+              
+              session = { browser, context, page, expiry: Date.now() + SESSION_TTL };
+              sessions.set(fileSessionId, session);
+              effectiveSessionId = fileSessionId;
+              sessionLoaded = true;
+              break;
+            } catch (e) {
+              continue;
+            }
+          }
+        }
+        
+        if (!sessionLoaded) {
+          const activeSessions = Array.from(sessions.keys());
+          return res.status(400).json({
+            ok: false,
+            error: 'Session not found',
+            details: { 
+              step: 'OTP',
+              requested_session_id: session_id || 'none',
+              effective_session_id: effectiveSessionId,
+              latest_session_id: latestSessionId,
+              active_sessions: activeSessions,
+              session_files: jsonFiles,
+              session_files_count: jsonFiles.length,
+              error_details: err.message,
+              hint: 'Tried to load from file but failed. Session may have expired (15 min TTL) or file may be corrupted.'
+            }
+          });
+        }
       }
     } else {
       browser = session.browser;
+      if (session.expiry < Date.now()) {
+        sessions.delete(effectiveSessionId);
+        return res.status(400).json({
+          ok: false,
+          error: 'Session expired',
+          details: { 
+            step: 'OTP',
+            session_id: effectiveSessionId,
+            expiry: new Date(session.expiry).toISOString(),
+            hint: 'Session TTL is 15 minutes. Please wait for the next scheduled login.'
+          }
+        });
+      }
+      
+      let pageClosed = false;
+      try {
+        pageClosed = !session.page || session.page.isClosed();
+      } catch (e) {
+        pageClosed = true;
+      }
+      
+      if (pageClosed) {
+        const sessionPath = await getSessionPath(effectiveSessionId);
+        try {
+          await fs.access(sessionPath);
+          const storageStateData = await fs.readFile(sessionPath, 'utf-8');
+          const storageState = JSON.parse(storageStateData);
+          
+          if (session.browser) {
+            await session.browser.close().catch(() => {});
+          }
+          
+          browser = await chromium.launch(chromiumLaunchOptions());
+          const context = await browser.newContext({ storageState });
+          const page = await context.newPage();
+          
+          await page.goto('https://login.pwc.com/login/?goto=https:%2F%2Flogin.pwc.com:443%2Fopenam%2Foauth2%2Fauthorize%3Fresponse_type%3Dcode%26client_id%3Durn%253Acompliancenominationportal.in.pwc.com%26redirect_uri%3Dhttps%253A%252F%252Fcompliancenominationportal.in.pwc.com%26scope%3Dopenid%26state%3Ddemo&realm=%2Fpwc');
+          
+          await page.waitForLoadState('networkidle', { timeout: 15000 }).catch(() => {});
+          await page.waitForTimeout(3000);
+          
+          const currentUrlAfterRestore = page.url();
+          const pageText = await page.textContent('body').catch(() => '');
+          
+          if (!pageText.toLowerCase().includes('verification code') && !pageText.toLowerCase().includes('one-time')) {
+            try {
+              const otpInput = await findOtpInputInAllFrames(page, 10000);
+              if (!otpInput) {
+                await page.waitForSelector('input[type="text"], input[type="tel"], input[placeholder*="code" i]', { timeout: 5000 }).catch(() => {});
+              }
+            } catch (e) {}
+          }
+          
+          session = { browser, context, page, expiry: Date.now() + SESSION_TTL };
+          sessions.set(effectiveSessionId, session);
+        } catch (restoreErr) {
+          sessions.delete(effectiveSessionId);
+          return res.status(400).json({
+            ok: false,
+            error: 'Session page closed and cannot be restored',
+            details: { 
+              step: 'OTP',
+              session_id: effectiveSessionId,
+              error: restoreErr.message,
+              hint: 'Session may need to be recreated. Wait for next scheduled login.'
+            }
+          });
+        }
+      }
     }
 
     const { page, context } = session;
@@ -535,41 +668,80 @@ app.post('/complete-login', async (req, res) => {
     }
 
     await page.waitForLoadState('networkidle', { timeout: 30000 });
+    await page.waitForTimeout(2000);
 
     const currentUrl = page.url();
+    const pageTitle = await page.title().catch(() => '');
+    const cookies = await context.cookies();
+    
     let loginSuccess = false;
+    const successIndicators = [];
 
-    if (currentUrl.includes('compliancenomination')) {
+    if (currentUrl.includes('compliancenomination') || currentUrl.includes('pwc.com')) {
+      successIndicators.push('URL matches PwC domain');
+    }
+
+    const selectorsToTry = [
+      { sel: 'table', name: 'table element' },
+      { sel: '#dashboard', name: 'dashboard element' },
+      { sel: 'text="Background Verification"', name: 'Background Verification text' },
+      { sel: 'body', name: 'page body' }
+    ];
+
+    for (const { sel, name } of selectorsToTry) {
       try {
-        await page.waitForSelector('table', { timeout: 10000 });
-        loginSuccess = true;
-      } catch {
-        try {
-          await page.waitForSelector('#dashboard', { timeout: 2000 });
+        await page.waitForSelector(sel, { timeout: 3000 });
+        successIndicators.push(`Found ${name}`);
+        if (sel !== 'body') {
           loginSuccess = true;
-        } catch {
-          try {
-            await page.waitForSelector('text="Background Verification"', { timeout: 2000 });
-            loginSuccess = true;
-          } catch (err) {
-            loginSuccess = false;
-          }
+          break;
         }
+      } catch (e) {
+        continue;
+      }
+    }
+
+    if (!loginSuccess && cookies.length > 0) {
+      const hasAuthCookie = cookies.some(c => 
+        c.name.includes('session') || 
+        c.name.includes('token') || 
+        c.name.includes('auth') ||
+        c.domain.includes('pwc.com')
+      );
+      if (hasAuthCookie) {
+        loginSuccess = true;
+        successIndicators.push('Auth cookies present');
+      }
+    }
+
+    if (!loginSuccess && (currentUrl.includes('pwc.com') || currentUrl.includes('compliancenomination'))) {
+      const bodyText = await page.textContent('body').catch(() => '');
+      if (bodyText && bodyText.length > 100 && !bodyText.toLowerCase().includes('sign in') && !bodyText.toLowerCase().includes('login')) {
+        loginSuccess = true;
+        successIndicators.push('Page content suggests logged-in state');
       }
     }
 
     if (!loginSuccess) {
+      const scr = await page.screenshot({ fullPage: true, type: 'png' }).catch(() => null);
       await browser.close();
       sessions.delete(effectiveSessionId);
       await fs.unlink(await getSessionPath(effectiveSessionId)).catch(() => {});
       return res.status(500).json({
         ok: false,
         error: 'Login incomplete',
-        details: { step: 'OTP' }
+        details: { 
+          step: 'login:success-check',
+          url: currentUrl,
+          title: pageTitle,
+          cookies_count: cookies.length,
+          checked_indicators: successIndicators
+        },
+        screenshot_base64: scr ? scr.toString('base64') : undefined
       });
     }
 
-    const cookies = await context.cookies();
+    const finalCookies = await context.cookies();
     const screenshot = await page.screenshot({ type: 'png' });
     const screenshot_base64 = screenshot.toString('base64');
 
@@ -580,7 +752,7 @@ app.post('/complete-login', async (req, res) => {
     return res.status(200).json({
       ok: true,
       message: 'Login complete',
-      cookies,
+      cookies: finalCookies,
       screenshot_base64
     });
 
