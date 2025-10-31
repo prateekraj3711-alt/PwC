@@ -267,188 +267,26 @@ app.post('/start-login', async (req, res) => {
       return res.status(500).json({ ok: false, error: 'Submit button not found', details: { step: 'login:submit' } });
     }
 
-    await page.waitForTimeout(2000);
+    await page.waitForTimeout(3000);
 
-    let mfaHandled = false;
     try {
-      await page.waitForSelector('text=/Choose one of the following options/i', { timeout: 10000 }).catch(() => {});
-      await page.waitForSelector('text=/To verify your identity/i', { timeout: 10000 }).catch(() => {});
-      
-      const emailRadioSelectors = [
-        'label:has-text(/Email me at/i)',
-        'label:has-text(/Email me at/i) input[type="radio"]',
-        'text=/Email me at/i >> .. >> input[type="radio"]',
-        'input[type="radio"][value*="email" i]',
-        'input[type="radio"] >> visible=true'
-      ];
-      
-      let emailSelected = false;
-      for (const sel of emailRadioSelectors) {
-        try {
-          const locator = page.locator(sel).first();
-          if (await locator.isVisible({ timeout: 3000 }).catch(() => false)) {
-            if (sel.includes('label')) {
-              await locator.click({ timeout: 3000 });
-            } else {
-              const isChecked = await locator.isChecked().catch(() => false);
-              if (!isChecked) {
-                await locator.click({ timeout: 3000 });
-              }
-            }
-            await page.waitForTimeout(500);
-            emailSelected = true;
-            break;
-          }
-        } catch (e) {
-          continue;
-        }
-      }
-      
-      if (!emailSelected) {
-        try {
-          const allRadios = await page.locator('input[type="radio"]').all();
-          for (const radio of allRadios) {
-            const labelText = await radio.evaluate(el => {
-              const label = el.closest('label') || document.querySelector(`label[for="${el.id}"]`);
-              return label ? label.textContent.trim() : '';
-            }).catch(() => '');
-            if (labelText.toLowerCase().includes('email me at')) {
-              await radio.click();
-              await page.waitForTimeout(500);
-              emailSelected = true;
-              break;
-            }
-          }
-        } catch (e) {}
-      }
+      await page.waitForSelector('text=Choose one of the following options', { timeout: 15000 });
 
-      if (emailSelected) {
-        await page.waitForTimeout(1000);
-        
-        let sendClicked = false;
-        
-        const sendCodeSelectors = [
-          'button:has-text("Send my code")',
-          'button:has-text("Email me a code")',
-          'button:has-text("Send code")',
-          'button:has-text("Send verification code")',
-          'button >> text=/Send my code/i',
-          'button >> text=/Send.*code/i',
-          'button[type="submit"]',
-          'input[type="submit"]'
-        ];
-        
-        for (const sel of sendCodeSelectors) {
-          try {
-            const btn = page.locator(sel).first();
-            const isVisible = await btn.isVisible({ timeout: 2000 }).catch(() => false);
-            if (isVisible) {
-              await btn.waitFor({ state: 'visible', timeout: 2000 }).catch(() => {});
-              await btn.click({ force: false, timeout: 3000 });
-              sendClicked = true;
-              break;
-            }
-          } catch (e) {
-            continue;
-          }
-        }
-        
-        if (!sendClicked) {
-          try {
-            const allButtons = await page.locator('button').all();
-            for (const btn of allButtons) {
-              try {
-                const btnText = await btn.textContent().catch(() => '');
-                if (btnText && (btnText.toLowerCase().includes('send my code') || btnText.toLowerCase().includes('send code') || btnText.toLowerCase().trim() === 'send my code')) {
-                  const isVisible = await btn.isVisible({ timeout: 1000 }).catch(() => false);
-                  if (isVisible) {
-                    await btn.click({ force: false });
-                    sendClicked = true;
-                    break;
-                  }
-                }
-              } catch (e) {
-                continue;
-              }
-            }
-          } catch (e) {}
-        }
-        
-        if (!sendClicked) {
-          try {
-            const clicked = await page.evaluate(() => {
-              const buttons = Array.from(document.querySelectorAll('button'));
-              for (const btn of buttons) {
-                const text = btn.textContent.trim().toLowerCase();
-                if (text.includes('send my code') || text === 'send my code' || text.includes('send code')) {
-                  if (btn.disabled) {
-                    btn.disabled = false;
-                  }
-                  btn.click();
-                  btn.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }));
-                  return true;
-                }
-              }
-              const inputs = Array.from(document.querySelectorAll('input[type="submit"]'));
-              for (const inp of inputs) {
-                const text = (inp.value || '').trim().toLowerCase();
-                if (text.includes('send') && text.includes('code')) {
-                  inp.click();
-                  inp.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }));
-                  return true;
-                }
-              }
-              return false;
-            });
-            if (clicked) {
-              sendClicked = true;
-            }
-          } catch (e) {}
-        }
-        
-        if (!sendClicked) {
-          try {
-            const allButtons = await page.locator('button').all();
-            for (const btn of allButtons) {
-              try {
-                const btnText = await btn.textContent().catch(() => '');
-                if (btnText && btnText.toLowerCase().includes('send')) {
-                  await btn.click({ force: true }).catch(() => {});
-                  sendClicked = true;
-                  break;
-                }
-              } catch (e) {
-                continue;
-              }
-            }
-          } catch (e) {}
-        }
-        
-        if (sendClicked) {
-          await page.waitForTimeout(3000);
-          try {
-            await page.waitForNavigation({ waitUntil: 'networkidle', timeout: 10000 }).catch(() => {});
-          } catch (e) {}
-          await page.waitForTimeout(1000);
-        }
-        
-        mfaHandled = sendClicked;
-      }
-    } catch (e) {}
+      const emailOption = page.locator('text=/Email me at/i').first();
+      await emailOption.click({ force: true });
 
-    const pageText = await page.textContent('body').catch(() => '');
-    const isMfaPage = pageText.includes('Choose one of the following options') || 
-                      pageText.includes('To verify your identity') ||
-                      pageText.includes('Email me at');
+      const sendBtn = page.locator('button:has-text("Send my code")');
+      await sendBtn.click();
 
-    if (isMfaPage && !mfaHandled) {
+      await page.waitForSelector('input[type="text"], input[type="tel"], input[placeholder*="code" i]', { timeout: 20000 });
+    } catch (err) {
       const scr = await page.screenshot({ fullPage: true, type: 'png' }).catch(() => null);
       await browser.close();
-      return res.status(500).json({ 
-        ok: false, 
-        error: 'MFA selection failed', 
-        details: { step: 'mfa:select-email', reason: 'Could not select Email option or click Send my code button' }, 
-        screenshot_base64: scr ? scr.toString('base64') : undefined 
+      return res.status(500).json({
+        ok: false,
+        error: 'MFA selection failed',
+        details: { step: 'mfa:select-email', reason: err.message },
+        screenshot_base64: scr ? scr.toString('base64') : undefined
       });
     }
 
