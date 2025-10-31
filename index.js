@@ -270,15 +270,30 @@ app.post('/start-login', async (req, res) => {
     await page.waitForTimeout(3000);
 
     try {
-      await page.waitForSelector('text=Choose one of the following options', { timeout: 15000 });
+      await page.waitForSelector('text=Choose one of the following options', { timeout: 20000 });
 
       const emailOption = page.locator('text=/Email me at/i').first();
       await emailOption.click({ force: true });
 
       const sendBtn = page.locator('button:has-text("Send my code")');
-      await sendBtn.click();
+      await sendBtn.waitFor({ state: 'attached', timeout: 15000 });
 
-      await page.waitForSelector('input[type="text"], input[type="tel"], input[placeholder*="code" i]', { timeout: 20000 });
+      let clicked = false;
+      for (let i = 0; i < 10; i++) {
+        const disabled = await sendBtn.getAttribute('disabled').catch(() => null);
+        if (!disabled) {
+          await sendBtn.click({ force: true });
+          clicked = true;
+          break;
+        }
+        await page.waitForTimeout(1000);
+      }
+
+      if (!clicked) {
+        throw new Error('Send my code button did not become enabled within 10 seconds');
+      }
+
+      await page.waitForSelector('input[type="tel"], input[type="text"], input[placeholder*="code" i]', { timeout: 20000 });
     } catch (err) {
       const scr = await page.screenshot({ fullPage: true, type: 'png' }).catch(() => null);
       await browser.close();
