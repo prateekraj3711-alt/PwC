@@ -275,25 +275,63 @@ app.post('/start-login', async (req, res) => {
       const emailOption = page.locator('text=/Email me at/i').first();
       await emailOption.click({ force: true });
 
-      const sendBtn = page.locator('button:has-text("Send my code")');
-      await sendBtn.waitFor({ state: 'attached', timeout: 15000 });
-
+      const frames = [page.mainFrame(), ...page.frames()];
       let clicked = false;
-      for (let i = 0; i < 10; i++) {
-        const disabled = await sendBtn.getAttribute('disabled').catch(() => null);
-        if (!disabled) {
-          await sendBtn.click({ force: true });
-          clicked = true;
-          break;
+
+      for (const frame of frames) {
+        const btnSelectors = [
+          'button:has-text("Send my code")',
+          'button:has-text("Send code")',
+          'input[value*="Send my code" i]',
+          'input[value*="Send code" i]'
+        ];
+
+        for (const sel of btnSelectors) {
+          try {
+            const btn = frame.locator(sel).first();
+            const count = await btn.count().catch(() => 0);
+            if (count > 0) {
+              await btn.waitFor({ state: 'attached', timeout: 5000 }).catch(() => {});
+              
+              for (let i = 0; i < 10; i++) {
+                const disabled = await btn.getAttribute('disabled').catch(() => null);
+                if (!disabled) {
+                  await btn.click({ force: true });
+                  clicked = true;
+                  break;
+                }
+                await page.waitForTimeout(1000);
+              }
+              
+              if (clicked) break;
+            }
+          } catch (e) {
+            continue;
+          }
         }
-        await page.waitForTimeout(1000);
+        if (clicked) break;
       }
 
       if (!clicked) {
-        throw new Error('Send my code button did not become enabled within 10 seconds');
+        const jsClicked = await page.evaluate(() => {
+          const btns = Array.from(document.querySelectorAll('button, input[type=submit]'));
+          const target = btns.find(b => /send.*code/i.test(b.textContent || b.value || ''));
+          if (target) {
+            target.click();
+            return true;
+          }
+          return false;
+        });
+        if (jsClicked) {
+          clicked = true;
+        }
       }
 
-      await page.waitForSelector('input[type="tel"], input[type="text"], input[placeholder*="code" i]', { timeout: 20000 });
+      if (!clicked) {
+        throw new Error('Could not find or click Send my code button in any frame');
+      }
+
+      await page.waitForSelector('input[type="text"], input[type="tel"], input[placeholder*="code" i]', { timeout: 30000 });
     } catch (err) {
       const scr = await page.screenshot({ fullPage: true, type: 'png' }).catch(() => null);
       await browser.close();
