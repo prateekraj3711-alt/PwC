@@ -560,8 +560,7 @@ app.post('/complete-login', async (req, res) => {
               active_sessions: activeSessions,
               session_files: jsonFiles,
               session_files_count: jsonFiles.length,
-              error_details: err.message,
-              hint: 'Tried to load from file but failed. Session may have expired (15 min TTL) or file may be corrupted.'
+              hint: 'Tried multiple paths to load session file but failed. Session may have expired (15 min TTL) or file may not exist.'
             }
           });
         }
@@ -646,8 +645,7 @@ app.post('/complete-login', async (req, res) => {
             details: { 
               step: 'OTP',
               session_id: effectiveSessionId,
-              error: restoreErr.message,
-              hint: 'Session may need to be recreated. Wait for next scheduled login.'
+              hint: 'Tried multiple paths to restore session but failed. Session may need to be recreated. Wait for next scheduled login.'
             }
           });
         }
