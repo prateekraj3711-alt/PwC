@@ -419,15 +419,23 @@ app.post('/complete-login', async (req, res) => {
   try {
     const { session_id, otp } = req.body;
 
-    if (!session_id || !otp) {
+    if (!otp) {
       return res.status(400).json({
         ok: false,
-        error: 'Missing session_id or otp',
+        error: 'Missing otp',
         details: { step: 'OTP' }
       });
     }
 
     let effectiveSessionId = session_id || latestSessionId;
+    
+    if (!effectiveSessionId) {
+      return res.status(400).json({
+        ok: false,
+        error: 'No active session. Please start login first.',
+        details: { step: 'OTP' }
+      });
+    }
     let session = sessions.get(effectiveSessionId);
     
     if (!session) {
