@@ -1,9 +1,25 @@
 node_modules/
 .env
 tmp/
+.cache/
+*.log
+.DS_Store
+
+# Google credentials (use Render Secret Files)
+credentials.json
+
+# Session storage files
 *.json
 !package.json
 !replit.yaml
-*.log
-.DS_Store
+!render.yaml
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+
+# Snapshots (optional - can be regenerated)
+snapshots/
 
