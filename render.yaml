@@ -8,14 +8,13 @@ services:
     region: oregon
     healthCheckPath: /health
     buildCommand: |
-      npm ci
-      npx playwright install --with-deps chromium
+      npm install
+      npx playwright install chromium
     startCommand: node index.js
     envVars:
       - key: NODE_ENV
         value: production
       - key: PLAYWRIGHT_BROWSERS_PATH
-        value: "0"
+        value: /tmp/pw-browsers
       - key: PLAYWRIGHT_SKIP_VALIDATE_HOST_REQUIREMENTS
         value: "1"
-
