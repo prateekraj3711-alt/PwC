@@ -7,7 +7,7 @@ services:
     rootDir: ""
     autoDeploy: true
     region: oregon
-    healthCheckPath: /
+    healthCheckPath: /health
     buildCommand: pip install --upgrade pip setuptools wheel && pip install --prefer-binary -r requirements.txt && playwright install chromium
     startCommand: uvicorn export_dashboard:app --host 0.0.0.0 --port $PORT
 
