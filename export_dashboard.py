@@ -15,7 +15,7 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from playwright.async_api import async_playwright, Browser, Page, Download
 import pandas as pd
-from google.oauth2.service_account import Credentials
+from google.oauth2 import service_account
 from googleapiclient.discovery import build
 
 # Setup logging
@@ -29,6 +29,7 @@ app = FastAPI(title="PwC Dashboard Export API")
 
 # Environment variables
 GOOGLE_SHEET_ID = os.getenv("GOOGLE_SHEET_ID")
+GOOGLE_CREDENTIALS_JSON = os.getenv("GOOGLE_CREDENTIALS_JSON")
 GOOGLE_CREDENTIALS_PATH = os.getenv("GOOGLE_CREDENTIALS_PATH", "credentials.json")
 TMP_DIR = Path(os.getenv("TMP_DIR", "/tmp"))
 SNAPSHOTS_DIR = TMP_DIR / "snapshots"
@@ -52,18 +53,42 @@ SNAPSHOTS_DIR.mkdir(parents=True, exist_ok=True)
 (TMP_DIR / "dashboard_exports").mkdir(parents=True, exist_ok=True)
 
 
-def get_google_sheets_service():
-    """Initialize Google Sheets API service using service account credentials"""
+def get_sheets_service():
+    """Initialize Google Sheets API service using service account credentials
+    
+    Priority:
+    1. GOOGLE_CREDENTIALS_JSON (environment variable, JSON string)
+    2. GOOGLE_CREDENTIALS_PATH or credentials.json (file path, backward compatibility)
+    """
+    scopes = ['https://www.googleapis.com/auth/spreadsheets']
+    
+    try:
+        if GOOGLE_CREDENTIALS_JSON:
+            creds_info = json.loads(GOOGLE_CREDENTIALS_JSON)
+            creds = service_account.Credentials.from_service_account_info(
+                creds_info,
+                scopes=scopes
+            )
+            service = build('sheets', 'v4', credentials=creds)
+            logger.info("Google Sheets service initialized from GOOGLE_CREDENTIALS_JSON")
+            return service
+    except json.JSONDecodeError as e:
+        logger.error(f"Invalid JSON in GOOGLE_CREDENTIALS_JSON: {e}")
+        raise
+    except Exception as e:
+        logger.warning(f"Failed to load from GOOGLE_CREDENTIALS_JSON: {e}")
+    
     try:
         creds_path = Path(GOOGLE_CREDENTIALS_PATH)
         if not creds_path.exists():
             raise FileNotFoundError(f"Credentials file not found: {GOOGLE_CREDENTIALS_PATH}")
         
-        creds = Credentials.from_service_account_file(
+        creds = service_account.Credentials.from_service_account_file(
             creds_path,
-            scopes=['https://www.googleapis.com/auth/spreadsheets']
+            scopes=scopes
         )
         service = build('sheets', 'v4', credentials=creds)
+        logger.info(f"Google Sheets service initialized from file: {GOOGLE_CREDENTIALS_PATH}")
         return service
     except Exception as e:
         logger.error(f"Failed to initialize Google Sheets service: {e}")
@@ -208,7 +233,7 @@ def incremental_sync(
     Returns dict with counts: {"new": X, "updated": Y, "skipped": Z}
     """
     try:
-        service = get_google_sheets_service()
+        service = get_sheets_service()
         
         try:
             df_new = pd.read_excel(excel_path)
@@ -667,7 +692,8 @@ async def root():
         "ok": True,
         "message": "PwC Dashboard Export API",
         "endpoints": {
-            "POST /export-dashboard": "Export dashboard tabs to Google Sheets with incremental sync"
+            "POST /export-dashboard": "Export dashboard tabs to Google Sheets with incremental sync",
+            "GET /test-sheets": "Test Google Sheets connectivity and write a test row"
         }
     }
 
@@ -693,6 +719,53 @@ async def export_dashboard_endpoint(request: ExportRequest):
     except Exception as e:
         logger.error(f"Export endpoint error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/test-sheets")
+async def test_sheets():
+    """Test Google Sheets connectivity by writing a test row"""
+    try:
+        if not GOOGLE_SHEET_ID:
+            raise HTTPException(
+                status_code=400,
+                detail="GOOGLE_SHEET_ID environment variable is required"
+            )
+        
+        service = get_sheets_service()
+        
+        from datetime import datetime, timezone
+        test_row = [
+            "Test Connected ✅",
+            datetime.now(timezone.utc).isoformat()
+        ]
+        
+        sheet_name = "TestConnection"
+        range_name = f"{sheet_name}!A:B"
+        
+        service.spreadsheets().values().append(
+            spreadsheetId=GOOGLE_SHEET_ID,
+            range=range_name,
+            valueInputOption="RAW",
+            body={"values": [test_row]}
+        ).execute()
+        
+        logger.info(f"Test row written to {GOOGLE_SHEET_ID} / {sheet_name}")
+        
+        return JSONResponse(content={
+            "ok": True,
+            "message": "Write test successful",
+            "spreadsheet_id": GOOGLE_SHEET_ID,
+            "sheet": sheet_name
+        })
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Test sheets error: {e}")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Test failed: {str(e)}"
+        )
 
 
 if __name__ == "__main__":
