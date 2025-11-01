@@ -1,5 +1,6 @@
 """
 FastAPI + Playwright + Google Sheets Dashboard Export with Incremental Sync
+Auto-triggers after successful login completion
 """
 import asyncio
 import os
@@ -18,7 +19,10 @@ from google.oauth2.service_account import Credentials
 from googleapiclient.discovery import build
 
 # Setup logging
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
 logger = logging.getLogger(__name__)
 
 app = FastAPI(title="PwC Dashboard Export API")
@@ -66,7 +70,7 @@ def get_google_sheets_service():
         raise
 
 
-def read_sheet_data(service, spreadsheet_id: str, sheet_name: str) -> pd.DataFrame:
+def read_sheet(service, spreadsheet_id: str, sheet_name: str) -> pd.DataFrame:
     """Read existing data from Google Sheet"""
     try:
         result = service.spreadsheets().values().get(
@@ -78,34 +82,29 @@ def read_sheet_data(service, spreadsheet_id: str, sheet_name: str) -> pd.DataFra
         if not values:
             return pd.DataFrame()
         
-        # First row as headers
         headers = values[0]
         if len(values) == 1:
             return pd.DataFrame(columns=headers)
         
-        # Rest as data
         data = values[1:]
-        
-        # Pad rows to match header length
         max_cols = len(headers)
         padded_data = [row + [''] * (max_cols - len(row)) for row in data]
         
         df = pd.DataFrame(padded_data, columns=headers)
+        logger.info(f"Read {len(df)} rows from sheet '{sheet_name}'")
         return df
     except Exception as e:
         logger.warning(f"Error reading sheet '{sheet_name}': {e}")
         return pd.DataFrame()
 
 
-def write_sheet_data(service, spreadsheet_id: str, sheet_name: str, df: pd.DataFrame):
+def write_sheet(service, spreadsheet_id: str, sheet_name: str, df: pd.DataFrame):
     """Write DataFrame to Google Sheet (overwrites entire sheet)"""
     try:
-        # Ensure sheet exists
         spreadsheet = service.spreadsheets().get(spreadsheetId=spreadsheet_id).execute()
         sheet_names = [s['properties']['title'] for s in spreadsheet.get('sheets', [])]
         
         if sheet_name not in sheet_names:
-            # Create sheet
             requests = [{
                 'addSheet': {
                     'properties': {
@@ -118,12 +117,10 @@ def write_sheet_data(service, spreadsheet_id: str, sheet_name: str, df: pd.DataF
                 body={'requests': requests}
             ).execute()
         
-        # Prepare data
         if df.empty:
             headers = [df.columns.tolist()] if len(df.columns) > 0 else [[]]
             values = headers
         else:
-            # Add timestamp column if not exists
             if "LastSyncedAt" not in df.columns:
                 df.insert(0, "LastSyncedAt", datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
             else:
@@ -132,7 +129,6 @@ def write_sheet_data(service, spreadsheet_id: str, sheet_name: str, df: pd.DataF
             headers = [df.columns.tolist()]
             values = headers + df.fillna('').values.tolist()
         
-        # Write data (overwrites existing)
         range_name = f"{sheet_name}!A1"
         service.spreadsheets().values().update(
             spreadsheetId=spreadsheet_id,
@@ -141,7 +137,6 @@ def write_sheet_data(service, spreadsheet_id: str, sheet_name: str, df: pd.DataF
             body={'values': values}
         ).execute()
         
-        # Clear remaining rows if data is shorter than before
         try:
             spreadsheet_after = service.spreadsheets().get(spreadsheetId=spreadsheet_id).execute()
             sheet = [s for s in spreadsheet_after.get('sheets', []) if s['properties']['title'] == sheet_name]
@@ -172,13 +167,11 @@ def load_snapshot(tab_name: str) -> Optional[pd.DataFrame]:
         with open(snapshot_path, 'r') as f:
             data = json.load(f)
         
-        # Handle both old and new snapshot formats
         if 'rows' in data and isinstance(data['rows'], list):
             if len(data['rows']) == 0:
                 return pd.DataFrame()
             df = pd.DataFrame(data['rows'])
         else:
-            # Legacy format: direct list of dicts
             df = pd.DataFrame(data)
         
         logger.info(f"Loaded snapshot for '{tab_name}': {len(df)} rows")
@@ -217,7 +210,6 @@ def incremental_sync(
     try:
         service = get_google_sheets_service()
         
-        # Read new Excel file
         try:
             df_new = pd.read_excel(excel_path)
         except Exception as e:
@@ -228,62 +220,46 @@ def incremental_sync(
             logger.warning(f"Excel file '{excel_path}' is empty")
             return {"new": 0, "updated": 0, "skipped": 0}
         
-        # Check if key column exists
         if key_col not in df_new.columns:
-            logger.warning(f"Key column '{key_col}' not found in Excel. Using first column as key.")
+            logger.warning(f"Key column '{key_col}' not found. Using first column: {df_new.columns[0]}")
             key_col = df_new.columns[0]
         
-        # Ensure key column has no duplicates in new data
         df_new = df_new.drop_duplicates(subset=[key_col], keep='last')
-        
-        # Normalize key column to string for consistent matching
         df_new[key_col] = df_new[key_col].astype(str).str.strip()
         
-        # Try to read existing sheet data
-        df_existing = read_sheet_data(service, spreadsheet_id, tab_name)
+        df_existing = read_sheet(service, spreadsheet_id, tab_name)
         
-        # If sheet is empty, try loading from snapshot
         if df_existing.empty:
             df_existing = load_snapshot(tab_name)
             if df_existing is None:
                 df_existing = pd.DataFrame()
         
-        # Initialize result counters
         new_count = 0
         updated_count = 0
         skipped_count = 0
         
         if df_existing.empty:
-            # All rows are new
             df_merged = df_new.copy()
             new_count = len(df_merged)
             logger.info(f"All {new_count} rows are new for '{tab_name}'")
         else:
-            # Ensure key column exists in existing data
             if key_col not in df_existing.columns:
                 logger.warning(f"Key column '{key_col}' not in existing sheet. Treating all as new.")
                 df_merged = pd.concat([df_existing, df_new], ignore_index=True)
                 new_count = len(df_new)
             else:
-                # Normalize key column in existing data to string
                 df_existing[key_col] = df_existing[key_col].astype(str).str.strip()
-                
-                # Merge logic
                 df_merged = df_existing.copy()
                 
                 for _, new_row in df_new.iterrows():
                     key_value = str(new_row[key_col]).strip()
-                    
-                    # Find matching row in existing data
                     mask = df_merged[key_col] == key_value
                     existing_idx = df_merged[mask].index
                     
                     if len(existing_idx) == 0:
-                        # New row
                         df_merged = pd.concat([df_merged, new_row.to_frame().T], ignore_index=True)
                         new_count += 1
                     else:
-                        # Check if any values changed (ignore LastSyncedAt and NaN differences)
                         existing_row = df_merged.loc[existing_idx[0]]
                         changed = False
                         
@@ -294,7 +270,6 @@ def incremental_sync(
                             old_val = existing_row.get(col)
                             new_val = new_row.get(col)
                             
-                            # Normalize NaN/None to empty string for comparison
                             old_val_str = '' if pd.isna(old_val) else str(old_val).strip()
                             new_val_str = '' if pd.isna(new_val) else str(new_val).strip()
                             
@@ -303,7 +278,6 @@ def incremental_sync(
                                 break
                         
                         if changed:
-                            # Update row
                             for col in df_new.columns:
                                 df_merged.loc[existing_idx[0], col] = new_row[col]
                             updated_count += 1
@@ -314,10 +288,7 @@ def incremental_sync(
                     f"Sync '{tab_name}': {new_count} new, {updated_count} updated, {skipped_count} skipped"
                 )
         
-        # Write merged data to sheet
-        write_sheet_data(service, spreadsheet_id, tab_name, df_merged)
-        
-        # Save snapshot for next run
+        write_sheet(service, spreadsheet_id, tab_name, df_merged)
         save_snapshot(tab_name, df_merged)
         
         return {
@@ -339,35 +310,35 @@ async def export_dashboard_tab(
 ) -> Optional[Dict]:
     """
     Export a single dashboard tab with incremental sync
-    
-    Returns dict with sync results or None if failed
+    Processes strictly one by one: click tab → wait for load → click export → wait for download → verify file
     """
     try:
-        logger.info(f"Processing tab: {tab_name}")
+        logger.info(f"📊 Starting export for tab: {tab_name}")
         
-        # Click the tab
+        # Step 1: Click the tab
         tab_selector = f'text="{tab_name}"'
+        logger.info(f"  → Step 1: Clicking tab '{tab_name}'")
         await page.wait_for_selector(tab_selector, timeout=30000)
         await page.click(tab_selector)
+        logger.info(f"  ✓ Tab '{tab_name}' clicked")
         
-        # Wait for tab content to load
+        # Step 2: Wait for tab to fully load
+        logger.info(f"  → Step 2: Waiting for tab '{tab_name}' to fully load...")
         await page.wait_for_load_state('networkidle', timeout=30000)
         await asyncio.sleep(2)
         
-        # Setup download listener
-        download_event = asyncio.Event()
-        downloaded_file = []
+        # Additional wait for tab content to be visible
+        try:
+            # Wait for common tab content indicators
+            await page.wait_for_selector('table, [role="table"], .table', timeout=10000)
+        except:
+            pass
         
-        async def handle_download(download: Download):
-            save_path = download_path / f"{tab_name}.xlsx"
-            await download.save_as(save_path)
-            downloaded_file.append(save_path)
-            download_event.set()
-            logger.info(f"Download completed: {save_path}")
+        await asyncio.sleep(1)
+        logger.info(f"  ✓ Tab '{tab_name}' fully loaded")
         
-        page.on("download", handle_download)
-        
-        # Click "Export to excel" button
+        # Step 3: Wait for "Export to excel" button to be visible and ready
+        logger.info(f"  → Step 3: Waiting for 'Export to excel' button to be visible...")
         export_selectors = [
             'button:has-text("Export to excel")',
             'button:has-text("Export to Excel")',
@@ -377,42 +348,116 @@ async def export_dashboard_tab(
             'button[title*="Export" i]'
         ]
         
-        export_clicked = False
+        export_button_found = False
+        export_button_selector = None
+        
         for selector in export_selectors:
             try:
-                await page.wait_for_selector(selector, timeout=5000)
-                await page.click(selector)
-                export_clicked = True
-                logger.info(f"Clicked export button with selector: {selector}")
-                break
+                await page.wait_for_selector(selector, timeout=10000)
+                is_visible = await page.locator(selector).first().is_visible()
+                if is_visible:
+                    export_button_found = True
+                    export_button_selector = selector
+                    logger.info(f"  ✓ Export button found and visible: {selector}")
+                    break
             except Exception:
                 continue
         
-        if not export_clicked:
-            raise Exception(f"Could not find Export button for tab: {tab_name}")
+        if not export_button_found:
+            raise Exception(f"Could not find or see Export button for tab: {tab_name}")
         
-        # Wait for download (with timeout)
+        # Step 4: Setup download listener before clicking
+        download_event = asyncio.Event()
+        downloaded_file = []
+        file_path = download_path / f"{tab_name}.xlsx"
+        download_handler = None
+        
+        async def handle_download(download: Download):
+            try:
+                await download.save_as(file_path)
+                downloaded_file.append(file_path)
+                download_event.set()
+                logger.info(f"  ✓ Download saved: {file_path}")
+            except Exception as e:
+                logger.error(f"  ✗ Error saving download: {e}")
+                download_event.set()
+        
+        download_handler = handle_download
+        page.on("download", download_handler)
+        
+        # Step 5: Click "Export to excel" button
+        logger.info(f"  → Step 5: Clicking 'Export to excel' button...")
+        try:
+            await page.click(export_button_selector)
+            logger.info(f"  ✓ Export button clicked")
+        except Exception as e:
+            if download_handler:
+                page.remove_listener("download", download_handler)
+            raise Exception(f"Failed to click export button: {e}")
+        
+        # Step 6: Wait for download to complete (with timeout)
+        logger.info(f"  → Step 6: Waiting for download to complete (max {EXPORT_TIMEOUT_MS/1000}s)...")
         try:
             await asyncio.wait_for(download_event.wait(), timeout=EXPORT_TIMEOUT_MS / 1000)
         except asyncio.TimeoutError:
-            logger.error(f"Download timeout for tab: {tab_name}")
-            page.remove_listener("download", handle_download)
+            logger.error(f"  ✗ Download timeout for tab: {tab_name} after {EXPORT_TIMEOUT_MS/1000}s")
+            if download_handler:
+                page.remove_listener("download", download_handler)
             return None
         
+        # Step 7: Verify file is saved and not empty
+        logger.info(f"  → Step 7: Verifying downloaded file exists...")
         if not downloaded_file:
-            logger.error(f"No file downloaded for tab: {tab_name}")
+            logger.error(f"  ✗ No file path recorded for tab: {tab_name}")
+            if download_handler:
+                page.remove_listener("download", download_handler)
             return None
         
-        file_path = downloaded_file[0]
+        # Wait a bit more and verify file exists (with retries)
+        max_file_check_retries = 5
+        file_exists = False
+        for retry in range(max_file_check_retries):
+            await asyncio.sleep(1)
+            if file_path.exists():
+                file_exists = True
+                break
+            logger.info(f"  → Waiting for file to appear... (retry {retry + 1}/{max_file_check_retries})")
         
-        # Perform incremental sync
+        if not file_exists:
+            logger.error(f"  ✗ File does not exist after waiting: {file_path}")
+            if download_handler:
+                page.remove_listener("download", download_handler)
+            return None
+        
+        file_size = file_path.stat().st_size
+        if file_size == 0:
+            logger.error(f"  ✗ Downloaded file is empty: {file_path}")
+            if download_handler:
+                page.remove_listener("download", download_handler)
+            try:
+                file_path.unlink()
+            except:
+                pass
+            return None
+        
+        logger.info(f"  ✓ File verified: {file_path.name} ({file_size} bytes)")
+        
+        # Step 8: Perform incremental sync
+        logger.info(f"  → Step 8: Syncing data to Google Sheets...")
         sync_result = incremental_sync(tab_name, file_path, spreadsheet_id, KEY_COLUMN)
+        logger.info(f"  ✓ Sync completed: {sync_result.get('new', 0)} new, {sync_result.get('updated', 0)} updated, {sync_result.get('skipped', 0)} skipped")
         
-        # Cleanup: remove downloaded file
+        # Step 9: Cleanup downloaded file
         try:
             file_path.unlink()
+            logger.info(f"  ✓ Cleaned up downloaded file")
         except Exception as e:
-            logger.warning(f"Failed to cleanup file {file_path}: {e}")
+            logger.warning(f"  ⚠ Failed to cleanup file {file_path}: {e}")
+        
+        if download_handler:
+            page.remove_listener("download", download_handler)
+        
+        logger.info(f"✅ Tab '{tab_name}' export completed successfully")
         
         return {
             "tab": tab_name,
@@ -420,7 +465,7 @@ async def export_dashboard_tab(
         }
         
     except Exception as e:
-        logger.error(f"Error processing tab '{tab_name}': {e}")
+        logger.error(f"❌ Error processing tab '{tab_name}': {e}")
         return None
 
 
@@ -436,12 +481,9 @@ async def export_dashboard(session_id: str, spreadsheet_id: str) -> Dict:
         Dict with export summary
     """
     tab_results = []
-    browser = None
     
     try:
-        # Determine session file path
         if session_id == "latest":
-            # Find latest session file
             session_dir = Path(SESSION_STORAGE_PATH)
             session_files = sorted(
                 session_dir.glob("*.json"),
@@ -457,15 +499,12 @@ async def export_dashboard(session_id: str, spreadsheet_id: str) -> Dict:
             if not session_storage_file.exists():
                 raise FileNotFoundError(f"Session storage not found: {session_storage_file}")
         
-        # Load session storage state
         with open(session_storage_file, 'r') as f:
             storage_state = json.load(f)
         
-        # Ensure tmp directory exists
         download_path = TMP_DIR / "dashboard_exports"
         download_path.mkdir(parents=True, exist_ok=True)
         
-        # Launch browser with session
         async with async_playwright() as p:
             browser = await p.chromium.launch(
                 headless=True,
@@ -479,41 +518,93 @@ async def export_dashboard(session_id: str, spreadsheet_id: str) -> Dict:
             
             page = await context.new_page()
             
-            # Navigate to dashboard
             dashboard_url = "https://compliancenominationportal.in.pwc.com/dashboard"
             await page.goto(dashboard_url, wait_until='networkidle', timeout=60000)
             await asyncio.sleep(3)
             
-            # Click "Advance search" button
-            try:
-                advance_search_selectors = [
-                    'text="Advance search"',
-                    'button:has-text("Advance search")',
-                    'a:has-text("Advance search")',
-                    '[aria-label*="Advance search" i]'
-                ]
-                
-                clicked = False
-                for selector in advance_search_selectors:
-                    try:
-                        await page.wait_for_selector(selector, timeout=10000)
-                        await page.click(selector)
-                        clicked = True
-                        logger.info("Clicked Advance search button")
-                        break
-                    except Exception:
-                        continue
-                
-                if clicked:
+            # Ensure "Advance search" is clicked and "Export to excel" button is visible
+            export_button_visible = False
+            max_retries = 3
+            
+            for attempt in range(max_retries):
+                try:
+                    # Click "Advance search"
+                    advance_search_selectors = [
+                        'text="Advance search"',
+                        'button:has-text("Advance search")',
+                        'a:has-text("Advance search")',
+                        '[aria-label*="Advance search" i]'
+                    ]
+                    
+                    clicked = False
+                    for selector in advance_search_selectors:
+                        try:
+                            await page.wait_for_selector(selector, timeout=10000)
+                            await page.click(selector)
+                            clicked = True
+                            logger.info(f"Clicked Advance search button (attempt {attempt + 1}/{max_retries})")
+                            break
+                        except Exception:
+                            continue
+                    
+                    if not clicked:
+                        logger.warning(f"Advance search button not found (attempt {attempt + 1}/{max_retries})")
+                        if attempt < max_retries - 1:
+                            await asyncio.sleep(2)
+                            continue
+                    
+                    # Wait for page to load
                     await page.wait_for_load_state('networkidle', timeout=30000)
                     await asyncio.sleep(2)
-                else:
-                    logger.warning("Advance search button not found, continuing...")
                     
-            except Exception as e:
-                logger.warning(f"Error clicking Advance search: {e}, continuing...")
+                    # Check if "Export to excel" button is visible
+                    export_button_selectors = [
+                        'button:has-text("Export to excel")',
+                        'button:has-text("Export to Excel")',
+                        'a:has-text("Export to excel")',
+                        'a:has-text("Export to Excel")',
+                        '[aria-label*="Export" i]',
+                        'button[title*="Export" i]'
+                    ]
+                    
+                    export_visible = False
+                    for selector in export_button_selectors:
+                        try:
+                            await page.wait_for_selector(selector, timeout=5000)
+                            is_visible = await page.locator(selector).first().is_visible()
+                            if is_visible:
+                                export_visible = True
+                                logger.info(f"Export button is visible: {selector}")
+                                break
+                        except Exception:
+                            continue
+                    
+                    if export_visible:
+                        export_button_visible = True
+                        logger.info("✅ Advance search expanded successfully, export button is visible")
+                        break
+                    else:
+                        logger.warning(f"Export button not visible after Advance search (attempt {attempt + 1}/{max_retries})")
+                        if attempt < max_retries - 1:
+                            logger.info("Retrying Advance search click...")
+                            await asyncio.sleep(2)
+                            continue
+                        else:
+                            logger.error("Export button not visible after all retries, continuing anyway...")
+                            break
+                            
+                except Exception as e:
+                    logger.warning(f"Error in Advance search setup (attempt {attempt + 1}/{max_retries}): {e}")
+                    if attempt < max_retries - 1:
+                        await asyncio.sleep(2)
+                        continue
             
-            # Process each tab
+            if not export_button_visible:
+                logger.warning("⚠️ Export button not confirmed visible, but proceeding with tab processing...")
+            
+            # Small delay before starting tab processing
+            await asyncio.sleep(1)
+            
             for tab_name in DASHBOARD_TABS:
                 try:
                     result = await export_dashboard_tab(
@@ -525,6 +616,7 @@ async def export_dashboard(session_id: str, spreadsheet_id: str) -> Dict:
                     
                     if result:
                         tab_results.append(result)
+                        logger.info(f"✅ Tab '{tab_name}': {result.get('new', 0)} new, {result.get('updated', 0)} updated, {result.get('skipped', 0)} skipped")
                     else:
                         tab_results.append({
                             "tab": tab_name,
@@ -533,8 +625,8 @@ async def export_dashboard(session_id: str, spreadsheet_id: str) -> Dict:
                             "skipped": 0,
                             "error": "Timeout or download failed"
                         })
+                        logger.warning(f"⚠️ Tab '{tab_name}': Failed")
                     
-                    # Small delay between tabs
                     await asyncio.sleep(1)
                     
                 except Exception as e:
@@ -547,8 +639,9 @@ async def export_dashboard(session_id: str, spreadsheet_id: str) -> Dict:
                         "error": str(e)
                     })
             
-            # Close browser
             await browser.close()
+        
+        logger.info(f"Export completed: {len([r for r in tab_results if not r.get('error')])}/{len(DASHBOARD_TABS)} tabs successful")
         
         return {
             "ok": True,
@@ -560,11 +653,6 @@ async def export_dashboard(session_id: str, spreadsheet_id: str) -> Dict:
         
     except Exception as e:
         logger.error(f"Export dashboard error: {e}")
-        if browser:
-            try:
-                await browser.close()
-            except:
-                pass
         raise
 
 
@@ -586,15 +674,7 @@ async def root():
 
 @app.post("/export-dashboard")
 async def export_dashboard_endpoint(request: ExportRequest):
-    """
-    Export PwC dashboard tabs to Google Sheets with incremental sync
-    
-    Request body:
-    {
-        "session_id": "uuid-from-login" or "latest" (default),
-        "spreadsheet_id": "optional-if-not-in-env"
-    }
-    """
+    """Export PwC dashboard tabs to Google Sheets with incremental sync"""
     try:
         session_id = request.session_id or "latest"
         sheet_id = request.spreadsheet_id or GOOGLE_SHEET_ID
