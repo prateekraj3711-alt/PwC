@@ -208,6 +208,7 @@ app.get('/', (req, res) => {
       'POST /zapier-start-login': 'Queue login asynchronously (returns ticket_id)',
       'POST /zapier-complete-login': 'Queue OTP completion asynchronously (returns ticket_id)',
       'GET /status/:ticket_id': 'Check status of async task',
+      'GET /fetch-data': 'Fetch data from portal after login (query: ?session_id=...&url=...)',
       'GET /debug/html': 'Get HTML and screenshot of current page (query: ?session_id=...)',
       'DELETE /sessions/all': 'Delete all sessions',
       'DELETE /sessions/:session_id': 'Delete specific session',
@@ -804,13 +805,39 @@ app.post('/complete-login', async (req, res) => {
     const screenshot = await page.screenshot({ type: 'png' });
     const screenshot_base64 = screenshot.toString('base64');
 
-    await browser.close();
-    sessions.delete(effectiveSessionId);
-    await fs.unlink(await getSessionPath(effectiveSessionId)).catch(() => {});
+    const sessionPath = await getSessionPath(effectiveSessionId);
+    const storageState = await context.storageState();
+    try {
+      await fs.writeFile(sessionPath, JSON.stringify(storageState), 'utf-8');
+    } catch (saveErr) {}
+
+    session.expiry = Date.now() + SESSION_TTL;
+    sessions.set(effectiveSessionId, session);
+
+    const exportServiceUrl = process.env.EXPORT_SERVICE_URL || 'http://localhost:8000';
+    
+    setImmediate(async () => {
+      try {
+        const exportResponse = await fetch(`${exportServiceUrl}/export-dashboard`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ session_id: effectiveSessionId })
+        });
+        const exportResult = await exportResponse.json().catch(() => null);
+        if (exportResult && exportResult.ok) {
+          console.log(`[Auto-Export] Completed for session ${effectiveSessionId}`);
+        } else {
+          console.warn(`[Auto-Export] Failed for session ${effectiveSessionId}: ${exportResult?.error || 'Unknown error'}`);
+        }
+      } catch (exportErr) {
+        console.error(`[Auto-Export] Error: ${exportErr.message}`);
+      }
+    });
 
     return res.status(200).json({
       ok: true,
       message: 'Login complete',
+      session_id: effectiveSessionId,
       cookies: finalCookies,
       screenshot_base64
     });
@@ -961,17 +988,177 @@ app.get('/debug/html', async (req, res) => {
   }
 });
 
+app.get('/fetch-data', async (req, res) => {
+  let browser = null;
+  try {
+    const sessionId = req.query.session_id || latestSessionId;
+    const targetUrl = req.query.url || 'https://compliancenominationportal.in.pwc.com';
+    
+    if (!sessionId) {
+      return res.status(404).json({ ok: false, error: 'No active session' });
+    }
+    
+    let session = sessions.get(sessionId);
+    
+    let pageClosed = false;
+    try {
+      pageClosed = !session || !session.page || session.page.isClosed();
+    } catch (e) {
+      pageClosed = true;
+    }
+    
+    if (pageClosed) {
+      const sessionPath = await getSessionPath(sessionId);
+      const sessionPathsToTry = [
+        sessionPath,
+        path.join('/tmp', 'pwc', `${sessionId}.json`),
+        path.join(__dirname, 'tmp', 'pwc', `${sessionId}.json`),
+        path.join(process.cwd(), 'tmp', 'pwc', `${sessionId}.json`)
+      ];
+      
+      let loaded = false;
+      for (const spath of sessionPathsToTry) {
+        try {
+          await fs.access(spath);
+          const storageStateData = await fs.readFile(spath, 'utf-8');
+          const storageState = JSON.parse(storageStateData);
+          
+          browser = await chromium.launch(chromiumLaunchOptions());
+          const context = await browser.newContext({ storageState });
+          const page = await context.newPage();
+          
+          session = { browser, context, page, expiry: Date.now() + SESSION_TTL };
+          sessions.set(sessionId, session);
+          loaded = true;
+          break;
+        } catch (e) {
+          continue;
+        }
+      }
+      
+      if (!loaded) {
+        return res.status(404).json({ ok: false, error: 'Session not found or expired' });
+      }
+    } else {
+      browser = session.browser;
+    }
+    
+    const { page } = session;
+    
+    const currentUrl = page.url();
+    if (!currentUrl.includes('compliancenominationportal.in.pwc.com')) {
+      await page.goto(targetUrl, { waitUntil: 'networkidle', timeout: 30000 });
+      await page.waitForTimeout(2000);
+    }
+    
+    await page.waitForLoadState('networkidle', { timeout: 15000 }).catch(() => {});
+    await page.waitForTimeout(2000);
+    
+    const data = await page.evaluate(() => {
+      const result = {
+        url: window.location.href,
+        title: document.title,
+        tables: [],
+        text_content: [],
+        links: [],
+        forms: []
+      };
+      
+      const tables = Array.from(document.querySelectorAll('table'));
+      tables.forEach((table, idx) => {
+        const rows = Array.from(table.querySelectorAll('tr'));
+        const tableData = rows.map(row => {
+          const cells = Array.from(row.querySelectorAll('th, td'));
+          return cells.map(cell => cell.textContent.trim());
+        }).filter(row => row.some(cell => cell.length > 0));
+        
+        if (tableData.length > 0) {
+          result.tables.push({
+            index: idx,
+            headers: tableData[0] || [],
+            rows: tableData.slice(1),
+            row_count: tableData.length - 1
+          });
+        }
+      });
+      
+      const headings = Array.from(document.querySelectorAll('h1, h2, h3, h4, h5, h6'));
+      result.text_content = headings.map(h => ({
+        level: h.tagName.toLowerCase(),
+        text: h.textContent.trim()
+      })).filter(h => h.text.length > 0);
+      
+      const links = Array.from(document.querySelectorAll('a[href]'));
+      result.links = links.map(a => ({
+        text: a.textContent.trim(),
+        href: a.href,
+        target: a.target || '_self'
+      })).filter(l => l.text.length > 0 || l.href.length > 0).slice(0, 50);
+      
+      const forms = Array.from(document.querySelectorAll('form'));
+      result.forms = forms.map((form, idx) => {
+        const inputs = Array.from(form.querySelectorAll('input, select, textarea'));
+        return {
+          index: idx,
+          action: form.action || '',
+          method: form.method || 'get',
+          fields: inputs.map(input => ({
+            name: input.name || '',
+            type: input.type || input.tagName.toLowerCase(),
+            value: input.value || '',
+            label: input.labels?.[0]?.textContent?.trim() || ''
+          }))
+        };
+      });
+      
+      const mainContent = document.querySelector('main, .content, #content, .main-content, [role="main"]') || document.body;
+      result.body_text = mainContent.textContent?.trim()?.substring(0, 5000) || '';
+      
+      return result;
+    });
+    
+    return res.status(200).json({
+      ok: true,
+      message: 'Data fetched successfully',
+      session_id: sessionId,
+      data
+    });
+    
+  } catch (err) {
+    let screenshot_base64 = undefined;
+    if (browser) {
+      try {
+        const contexts = browser.contexts();
+        if (contexts.length > 0) {
+          const pages = await contexts[0].pages();
+          if (pages.length > 0) {
+            const scr = await pages[0].screenshot({ fullPage: true, type: 'png' }).catch(() => null);
+            screenshot_base64 = scr ? scr.toString('base64') : undefined;
+          }
+        }
+      } catch (_) {}
+    }
+    return res.status(500).json({
+      ok: false,
+      error: err.message,
+      details: { step: 'fetch-data' },
+      screenshot_base64
+    });
+  }
+});
+
 const tickets = new Map();
 
 function queueJob(run) {
   const id = uuidv4();
-  tickets.set(id, { status: 'queued' });
+  const now = Date.now();
+  tickets.set(id, { status: 'queued', timestamp: now });
   setImmediate(async () => {
     try {
       const result = await run();
-      tickets.set(id, { status: 'done', result });
+      tickets.set(id, { status: 'done', result, timestamp: now, completed_at: Date.now() });
     } catch (err) {
-      tickets.set(id, { status: 'error', error: String(err && err.message ? err.message : err) });
+      tickets.set(id, { status: 'error', error: String(err && err.message ? err.message : err), timestamp: now, completed_at: Date.now() });
     }
   });
   return id;
@@ -1007,7 +1194,31 @@ app.post('/zapier-complete-login', async (req, res) => {
 app.get('/status/:ticket_id', (req, res) => {
   const t = tickets.get(req.params.ticket_id);
   if (!t) return res.status(404).json({ ok: false, error: 'Unknown ticket' });
-  return res.status(200).json({ ok: true, ...t });
+  
+  const operation = t.result?.message?.includes('Awaiting OTP') ? 'start-login' : 
+                    t.result?.message?.includes('Login complete') ? 'complete-login' :
+                    t.error ? 'error' : 'unknown';
+  
+  return res.status(200).json({ 
+    ok: true, 
+    ...t,
+    operation 
+  });
+});
+
+app.get('/tickets/recent', (req, res) => {
+  const recent = Array.from(tickets.entries())
+    .slice(-10)
+    .map(([id, data]) => ({
+      ticket_id: id,
+      status: data.status,
+      operation: data.result?.message?.includes('Awaiting OTP') ? 'start-login' : 
+                 data.result?.message?.includes('Login complete') ? 'complete-login' :
+                 data.error ? 'error' : 'unknown',
+      timestamp: data.timestamp || null
+    }))
+    .reverse();
+  return res.status(200).json({ ok: true, tickets: recent });
 });
 
 app.listen(PORT, '0.0.0.0', () => {});
