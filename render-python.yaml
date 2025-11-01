@@ -1,0 +1,13 @@
+services:
+  - type: web
+    name: pwc-export-service
+    env: python
+    runtime: python-3.11.10
+    plan: free
+    rootDir: ""
+    autoDeploy: true
+    region: oregon
+    healthCheckPath: /
+    buildCommand: pip install --upgrade pip setuptools wheel && pip install -r requirements.txt && playwright install chromium
+    startCommand: uvicorn export_dashboard:app --host 0.0.0.0 --port $PORT
+
