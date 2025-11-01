@@ -72,21 +72,126 @@ async def wait_full_load(page: Page, seconds=30, name="page"):
     await asyncio.sleep(2)
 
 
-async def click_advance_search(page: Page):
-    await wait_full_load(page, 30, "dashboard")
-    selectors = [
-        'button[data-bs-target="#collapse-advance-serach"]',
-        'button:has-text("Advance search")',
-        'text="Advance search"',
-    ]
+async def try_click_selector(page: Page, selectors, timeout_per=4000):
+    """Try clicking using multiple selectors (same pattern as login process)"""
     for sel in selectors:
         try:
-            await click_force(page, sel, name="Advance_search")
-            logger.info("✅ Advance Search clicked successfully")
-            return
+            await page.wait_for_selector(sel, timeout=timeout_per)
+            await page.click(sel)
+            return True
         except Exception:
             continue
-    raise Exception("Advance Search not clickable after retries")
+    return False
+
+
+async def click_advance_search(page: Page):
+    """Click Advance search button using the same robust logic as login process"""
+    logger.info("🔍 Waiting for dashboard to fully load...")
+    await wait_full_load(page, 30, "dashboard")
+    
+    # Check current URL
+    current_url = page.url
+    logger.info(f"📍 Current URL: {current_url}")
+    
+    # Wait for dynamic content
+    await asyncio.sleep(3)
+    
+    # Define all possible selectors (same pattern as login)
+    selectors = [
+        'button[data-bs-target="#collapse-advance-serach"]',
+        'button[data-bs-target="#collapse-advance-search"]',
+        'button:has-text("Advance search")',
+        'button:has-text("Advance Search")',
+        'a:has-text("Advance search")',
+        'a:has-text("Advance Search")',
+        'text="Advance search"',
+        'text="Advance Search"',
+        '[aria-label*="Advance search" i]',
+        '[aria-label*="Advance Search" i]',
+        'button[title*="Advance" i]',
+        'a[title*="Advance" i]',
+    ]
+    
+    # Try standard click approach first (same as tryClick in login)
+    clicked = await try_click_selector(page, selectors, timeout_per=4000)
+    if clicked:
+        await asyncio.sleep(2)
+        logger.info("✅ Advance Search clicked successfully")
+        return
+    
+    # If standard click failed, try frame-based approach (same as MFA button logic)
+    logger.info("Trying frame-based detection...")
+    all_frames = [page] + page.frames
+    
+    clicked = False
+    for frame in all_frames:
+        btn_selectors = [
+            'button:has-text("Advance search")',
+            'button:has-text("Advance Search")',
+            'a:has-text("Advance search")',
+            'a:has-text("Advance Search")',
+            'text="Advance search"',
+            'text="Advance Search"',
+        ]
+        
+        for sel in btn_selectors:
+            try:
+                btn = frame.locator(sel).first
+                count = await btn.count()
+                if count > 0:
+                    await btn.wait_for(state='attached', timeout=5000)
+                    
+                    # Wait for button to be enabled (same as Send my code logic)
+                    for i in range(10):
+                        disabled = await btn.get_attribute('disabled')
+                        if disabled is None or disabled == 'false' or disabled == '':
+                            await btn.click(force=True)
+                            await asyncio.sleep(2)
+                            logger.info("✅ Advance Search clicked via frame detection")
+                            clicked = True
+                            break
+                        await asyncio.sleep(1)  # Wait 1 second before retry
+                    
+                    if clicked:
+                        break
+            except Exception as e:
+                logger.debug(f"Frame selector {sel} failed: {e}")
+                continue
+        
+        if clicked:
+            break
+    
+    if clicked:
+        return
+    
+    # Last resort: JavaScript click (same pattern as login)
+    logger.info("Attempting JavaScript click...")
+    try:
+        js_clicked = await page.evaluate("""
+            () => {
+                const elements = Array.from(document.querySelectorAll('button, a, [role="button"]'));
+                for (let el of elements) {
+                    const text = (el.textContent || '').toLowerCase();
+                    if (text.includes('advance') && text.includes('search')) {
+                        el.click();
+                        return true;
+                    }
+                }
+                return false;
+            }
+        """)
+        if js_clicked:
+            await asyncio.sleep(3)
+            logger.info("✅ Advance Search clicked via JavaScript")
+            return
+    except Exception as e:
+        logger.warning(f"JavaScript click failed: {e}")
+    
+    # Final screenshot before error
+    error_screenshot = f"/tmp/advance_search_error_{datetime.now().strftime('%H%M%S')}.png"
+    await page.screenshot(path=error_screenshot, full_page=True)
+    logger.error(f"❌ Advance Search not found. Error screenshot: {error_screenshot}")
+    raise Exception(f"Advance Search not clickable after all attempts. URL: {current_url}")
 
 
 async def export_tab(page: Page, tab_name: str, download_dir: Path):
@@ -207,12 +312,33 @@ async def export_endpoint(req: ExportRequest):
     return JSONResponse(content=result)
 
 
+@app.get("/screenshots")
+async def list_screenshots():
+    """List all available screenshots"""
+    screenshot_files = []
+    tmp_dir = Path("/tmp")
+    for file in tmp_dir.glob("*.png"):
+        if file.is_file():
+            screenshot_files.append({
+                "filename": file.name,
+                "size_bytes": file.stat().st_size,
+                "modified": datetime.fromtimestamp(file.stat().st_mtime).isoformat(),
+                "url": f"/screenshots/{file.name}"
+            })
+    return JSONResponse(content={
+        "ok": True,
+        "screenshots": sorted(screenshot_files, key=lambda x: x["modified"], reverse=True),
+        "count": len(screenshot_files)
+    })
+
+
 @app.get("/screenshots/{filename}")
 async def get_screenshot(filename: str):
+    """Get a specific screenshot image"""
     file_path = Path(f"/tmp/{filename}")
     if file_path.exists():
-        return FileResponse(file_path)
-    raise HTTPException(status_code=404, detail="Screenshot not found")
+        return FileResponse(file_path, media_type="image/png")
+    raise HTTPException(status_code=404, detail=f"Screenshot not found: {filename}")
 
 
 @app.get("/test-sheets")
