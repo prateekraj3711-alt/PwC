@@ -160,17 +160,8 @@ async def export_dashboard(session_id: str, spreadsheet_id: str, storage_state: 
                     storage_state = json.load(f)
                     logger.info(f"Loaded session from local file: {session_file}")
             except FileNotFoundError:
-                logger.warning(f"Session file missing locally, fetching from login API for {session_id}")
-                try:
-                    r = requests.get(f"https://pwc-twhw.onrender.com/status/{session_id}", timeout=10)
-                    r.raise_for_status()
-                    data = r.json()
-                    storage_state = data["result"].get("session_state") or data["result"].get("storage_state")
-                    if not storage_state:
-                        raise Exception("session_state missing in response")
-                    logger.info(f"Fetched session from login service for {session_id}")
-                except Exception as e:
-                    raise FileNotFoundError(f"Could not load session: {e}")
+                logger.warning(f"Session file missing locally for {session_id}")
+                raise FileNotFoundError(f"Session file not found: {session_file}. Please provide storage_state in request or ensure session file exists.")
 
         async with async_playwright() as p:
             browser = await p.chromium.launch(headless=True, args=["--no-sandbox"])
@@ -203,12 +194,16 @@ async def export_dashboard(session_id: str, spreadsheet_id: str, storage_state: 
 
 class ExportRequest(BaseModel):
     session_id: str
-    spreadsheet_id: str
+    spreadsheet_id: Optional[str] = None
+    storage_state: Optional[Dict] = None
 
 
 @app.post("/export-dashboard")
 async def export_endpoint(req: ExportRequest):
-    result = await export_dashboard(req.session_id, req.spreadsheet_id)
+    spreadsheet_id = req.spreadsheet_id or GOOGLE_SHEET_ID
+    if not spreadsheet_id:
+        raise HTTPException(status_code=400, detail="spreadsheet_id required (set GOOGLE_SHEET_ID env or provide in request)")
+    result = await export_dashboard(req.session_id, spreadsheet_id, req.storage_state)
     return JSONResponse(content=result)
 
 
