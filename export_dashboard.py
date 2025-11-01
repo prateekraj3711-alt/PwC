@@ -65,9 +65,21 @@ def get_sheets_service():
     """
     scopes = ['https://www.googleapis.com/auth/spreadsheets']
     
-    try:
-        if GOOGLE_CREDENTIALS_JSON:
-            creds_info = json.loads(GOOGLE_CREDENTIALS_JSON)
+    if GOOGLE_CREDENTIALS_JSON:
+        try:
+            # Handle escaped newlines in JSON string (from environment variable)
+            # Replace \\n with actual newlines, but preserve \\\\n (double-escaped)
+            json_str = GOOGLE_CREDENTIALS_JSON.replace('\\n', '\n')
+            
+            # Try to parse as JSON
+            creds_info = json.loads(json_str)
+            
+            # Validate it's a service account credentials dict
+            if not isinstance(creds_info, dict):
+                raise ValueError("GOOGLE_CREDENTIALS_JSON must be a JSON object")
+            if creds_info.get('type') != 'service_account':
+                raise ValueError("GOOGLE_CREDENTIALS_JSON must be a service account credentials")
+            
             creds = service_account.Credentials.from_service_account_info(
                 creds_info,
                 scopes=scopes
@@ -75,27 +87,35 @@ def get_sheets_service():
             service = build('sheets', 'v4', credentials=creds)
             logger.info("Google Sheets service initialized from GOOGLE_CREDENTIALS_JSON")
             return service
-    except json.JSONDecodeError as e:
-        logger.error(f"Invalid JSON in GOOGLE_CREDENTIALS_JSON: {e}")
-        raise
-    except Exception as e:
-        logger.warning(f"Failed to load from GOOGLE_CREDENTIALS_JSON: {e}")
+            
+        except json.JSONDecodeError as e:
+            logger.error(f"Invalid JSON in GOOGLE_CREDENTIALS_JSON: {e}")
+            logger.error(f"JSON string length: {len(GOOGLE_CREDENTIALS_JSON)}")
+            raise ValueError(f"Invalid JSON format in GOOGLE_CREDENTIALS_JSON: {e}") from e
+        except Exception as e:
+            logger.error(f"Failed to load from GOOGLE_CREDENTIALS_JSON: {e}")
+            raise ValueError(f"Failed to initialize Google Sheets service from GOOGLE_CREDENTIALS_JSON: {e}") from e
     
-    try:
-        creds_path = Path(GOOGLE_CREDENTIALS_PATH)
-        if not creds_path.exists():
-            raise FileNotFoundError(f"Credentials file not found: {GOOGLE_CREDENTIALS_PATH}")
-        
-        creds = service_account.Credentials.from_service_account_file(
-            creds_path,
-            scopes=scopes
-        )
-        service = build('sheets', 'v4', credentials=creds)
-        logger.info(f"Google Sheets service initialized from file: {GOOGLE_CREDENTIALS_PATH}")
-        return service
-    except Exception as e:
-        logger.error(f"Failed to initialize Google Sheets service: {e}")
-        raise
+    # Fallback to file path only if GOOGLE_CREDENTIALS_JSON is not set
+    if not GOOGLE_CREDENTIALS_JSON:
+        try:
+            creds_path = Path(GOOGLE_CREDENTIALS_PATH)
+            if not creds_path.exists():
+                raise FileNotFoundError(f"Credentials file not found: {GOOGLE_CREDENTIALS_PATH}")
+            
+            creds = service_account.Credentials.from_service_account_file(
+                creds_path,
+                scopes=scopes
+            )
+            service = build('sheets', 'v4', credentials=creds)
+            logger.info(f"Google Sheets service initialized from file: {GOOGLE_CREDENTIALS_PATH}")
+            return service
+        except Exception as e:
+            logger.error(f"Failed to initialize Google Sheets service: {e}")
+            raise
+    
+    # If we get here, credentials are not available
+    raise ValueError("No Google credentials available. Set GOOGLE_CREDENTIALS_JSON or GOOGLE_CREDENTIALS_PATH")
 
 
 def read_sheet(service, spreadsheet_id: str, sheet_name: str) -> pd.DataFrame:
