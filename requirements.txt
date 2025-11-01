@@ -1,5 +1,5 @@
 fastapi==0.115.0
-uvicorn[standard]==0.32.0
+uvicorn[standard]
 pydantic==2.10.0
 playwright==1.48.0
 google-api-python-client==2.152.0
@@ -7,4 +7,3 @@ google-auth==2.35.0
 pandas>=2.2.0
 openpyxl==3.1.5
 numpy>=1.26.0
-
