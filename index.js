@@ -816,12 +816,25 @@ app.post('/complete-login', async (req, res) => {
 
     const exportServiceUrl = process.env.EXPORT_SERVICE_URL || 'http://localhost:8000';
     
-    setImmediate(async () => {
+    // Wait a moment for session file to be written
+    setTimeout(async () => {
       try {
+        // Read the session storage state to send it directly
+        let storageStateData = null;
+        try {
+          const sessionPath = await getSessionPath(effectiveSessionId);
+          storageStateData = await fs.readFile(sessionPath, 'utf-8');
+        } catch (readErr) {
+          console.warn(`[Auto-Export] Could not read session file: ${readErr.message}`);
+        }
+        
         const exportResponse = await fetch(`${exportServiceUrl}/export-dashboard`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ session_id: effectiveSessionId })
+          body: JSON.stringify({ 
+            session_id: effectiveSessionId,
+            storage_state: storageStateData ? JSON.parse(storageStateData) : null
+          })
         });
         const exportResult = await exportResponse.json().catch(() => null);
         if (exportResult && exportResult.ok) {
@@ -832,7 +845,7 @@ app.post('/complete-login', async (req, res) => {
       } catch (exportErr) {
         console.error(`[Auto-Export] Error: ${exportErr.message}`);
       }
-    });
+    }, 2000); // Wait 2 seconds for file to be written
 
     return res.status(200).json({
       ok: true,
