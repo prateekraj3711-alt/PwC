@@ -12,24 +12,26 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # ===== Set Working Directory =====
 WORKDIR /app
 
-# ===== Copy and Install Python Dependencies =====
-COPY PWC/requirements.txt ./requirements.txt
+# ===== Copy Requirements First (for build cache) =====
+COPY requirements.txt ./requirements.txt
+
+# ===== Install Python Dependencies =====
 RUN pip install --upgrade pip setuptools wheel
 RUN pip install --prefer-binary -r requirements.txt
 
-# ===== Install Playwright and Chromium Browser =====
-RUN python -m playwright install chromium
+# ===== Install Playwright and Chromium =====
+# The deps step ensures Playwright doesn’t fail if Render base image changes
+RUN python -m playwright install-deps chromium && python -m playwright install chromium
 
 # ===== Copy Application Code =====
-COPY PWC/ ./
+COPY . ./
 
-# ===== Environment and Port Config =====
+# ===== Environment Config =====
 ENV PORT=8000
 EXPOSE 8000
 
-# ===== Health Check (Optional, for Render dashboard) =====
+# ===== Health Check =====
 HEALTHCHECK CMD curl --fail http://localhost:${PORT}/health || exit 1
 
 # ===== Start FastAPI App =====
 CMD ["sh", "-c", "uvicorn export_dashboard:app --host 0.0.0.0 --port ${PORT:-8000}"]
-
