@@ -9,8 +9,7 @@ import pandas as pd
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
 
-logging.basicConfig(level=logging.INFO,
-                    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
 logger = logging.getLogger("export_dashboard")
 
 app = FastAPI(title="PwC Dashboard Export API")
@@ -21,16 +20,17 @@ TMP_DIR = Path("/tmp"); TMP_DIR.mkdir(exist_ok=True)
 EXPORT_TIMEOUT_MS = 240000
 KEY_COLUMN = "Candidate ID"
 DASHBOARD_TABS = [
-    "Today's allocated","Not started","Draft",
-    "Rejected / Insufficient","Submitted",
-    "Work in progress","BGV closed"
+    "Today's allocated", "Not started", "Draft",
+    "Rejected / Insufficient", "Submitted",
+    "Work in progress", "BGV closed"
 ]
 
 def get_sheets_service():
-    creds_info = json.loads(GOOGLE_CREDENTIALS_JSON)
     creds = service_account.Credentials.from_service_account_info(
-        creds_info, scopes=["https://www.googleapis.com/auth/spreadsheets"])
-    return build("sheets","v4",credentials=creds)
+        json.loads(GOOGLE_CREDENTIALS_JSON),
+        scopes=["https://www.googleapis.com/auth/spreadsheets"]
+    )
+    return build("sheets", "v4", credentials=creds)
 
 def write_sheet(service, spreadsheet_id, sheet_name, df):
     values = [df.columns.tolist()] + df.fillna("").values.tolist()
@@ -38,130 +38,161 @@ def write_sheet(service, spreadsheet_id, sheet_name, df):
         spreadsheetId=spreadsheet_id,
         range=f"{sheet_name}!A1",
         valueInputOption="RAW",
-        body={"values":values}).execute()
+        body={"values": values}
+    ).execute()
     logger.info(f"Wrote {len(df)} rows to sheet '{sheet_name}'")
 
-def incremental_sync(tab_name, excel_path, spreadsheet_id):
+def incremental_sync(tab, path, sid):
     try:
-        service = get_sheets_service()
-        df_new = pd.read_excel(excel_path)
-        if df_new.empty: return {"new":0}
-        write_sheet(service, spreadsheet_id, tab_name, df_new)
-        return {"new":len(df_new)}
+        s = get_sheets_service()
+        df = pd.read_excel(path)
+        if df.empty: return {"new": 0}
+        write_sheet(s, sid, tab, df)
+        return {"new": len(df)}
     except Exception as e:
-        logger.error(e); return {"error":str(e)}
+        logger.error(e); return {"error": str(e)}
 
-async def wait(seconds,msg=""):
+async def wait(seconds, msg=""):
     logger.info(f"⏳ Waiting {seconds}s {msg}...")
     await asyncio.sleep(seconds)
 
-async def click_advance_search(page:Page):
-    await wait(30,"for dashboard to load fully after login")
-    logger.info("🔍 Clicking Advance Search...")
-    selectors=[
-        "button[data-bs-target='#collapse-advance-serach']",
-        "button.btn.btn-warning",
-        "button:has-text('Advance search')",
-        "text='Advance search'"
-    ]
+async def safe_click(page: Page, selectors, label, wait_after=5):
     for attempt in range(3):
         for sel in selectors:
             try:
-                await page.wait_for_selector(sel,timeout=8000)
-                btn=page.locator(sel).first
-                await btn.scroll_into_view_if_needed()
-                await btn.click(force=True)
-                logger.info(f"Clicked Advance Search using {sel}")
-                await wait(30,"for Export button to appear")
-                exp=["button:has-text('Export to excel')","a:has-text('Export to excel')"]
-                for e in exp:
-                    try:
-                        await page.wait_for_selector(e,timeout=5000)
-                        logger.info("✅ Export button visible after Advance Search")
-                        return True
-                    except: continue
-            except: continue
-        logger.warning(f"Retrying Advance Search click {attempt+1}/3")
-    raise Exception("Advance Search not clickable after retries")
+                await page.wait_for_selector(sel, timeout=8000)
+                el = page.locator(sel).first
+                if await el.is_visible():
+                    await el.scroll_into_view_if_needed()
+                    await el.click(force=True)
+                    logger.info(f"✅ Clicked {label} using {sel}")
+                    await wait(wait_after)
+                    return True
+            except Exception:
+                continue
+        try:
+            txt = page.get_by_text(label, exact=False)
+            if await txt.is_visible():
+                await txt.scroll_into_view_if_needed()
+                await txt.click(force=True)
+                logger.info(f"✅ Force-clicked {label} by text reader")
+                await wait(wait_after)
+                return True
+        except Exception:
+            pass
+        try:
+            el = page.locator(f"text=/{label}/i").first
+            box = await el.bounding_box()
+            if box:
+                await page.mouse.click(box["x"] + box["width"]/2, box["y"] + box["height"]/2)
+                logger.info(f"🖱️ Bounding-box click for {label}")
+                await wait(wait_after)
+                return True
+        except Exception:
+            pass
+        logger.warning(f"Retrying click for {label} ({attempt+1}/3)")
+        await wait(3)
+    ts = datetime.now().strftime("%H%M%S")
+    ss_path = TMP_DIR / f"{label.replace(' ','_')}_fail_{ts}.png"
+    await page.screenshot(path=str(ss_path))
+    raise Exception(f"{label} not clickable after retries (screenshot: {ss_path})")
 
-async def export_tab(page:Page,tab:str,spreadsheet_id:str,download_path:Path):
-    logger.info(f"📊 Exporting tab: {tab}")
+async def export_tab(page: Page, tab: str, sid: str, download_dir: Path):
     try:
-        await page.wait_for_selector(f"text=\"{tab}\"",timeout=30000)
-        await page.click(f"text=\"{tab}\"")
-        await wait(30,f"after selecting tab {tab}")
-        exp="button:has-text('Export to excel')"
-        await page.wait_for_selector(exp,timeout=15000)
-        download_event=asyncio.Event(); file_path=download_path/f"{tab}.xlsx"
-        async def on_download(d:Download):
-            await d.save_as(file_path); download_event.set()
-        page.on("download",on_download)
-        await page.click(exp)
-        await asyncio.wait_for(download_event.wait(),timeout=EXPORT_TIMEOUT_MS/1000)
+        await safe_click(page, [f"text=\"{tab}\""], tab, wait_after=30)
+        await safe_click(page,
+                         ["button:has-text('Export to excel')",
+                          "a:has-text('Export to excel')",
+                          "text=/Export\\s*to\\s*excel/i"],
+                         "Export to Excel", wait_after=5)
+        download_event = asyncio.Event()
+        file_path = download_dir / f"{tab}.xlsx"
+        async def on_download(d: Download):
+            await d.save_as(file_path)
+            download_event.set()
+        page.on("download", on_download)
+        await asyncio.wait_for(download_event.wait(), timeout=EXPORT_TIMEOUT_MS/1000)
         await wait(2)
-        if not file_path.exists() or file_path.stat().st_size==0:
-            raise Exception("File not found/empty")
-        res=incremental_sync(tab,file_path,spreadsheet_id)
+        res = incremental_sync(tab, file_path, sid)
         file_path.unlink(missing_ok=True)
-        logger.info(f"✅ {tab} exported: {res}")
+        logger.info(f"✅ Exported {tab}: {res}")
         return res
     except Exception as e:
-        logger.error(f"❌ {tab} failed: {e}")
-        return {"error":str(e)}
+        logger.error(f"❌ Failed {tab}: {e}")
+        return {"error": str(e)}
 
-async def perform_logout(page:Page):
-    logger.info("🔒 Logging out...")
-    await wait(10,"before logout")
-    dropdown_selectors=[
-        "span.k-menu-expand-arrow",
-        "a.k-menu-link.k-active",
-        "text='Welcome'"
-    ]
-    for sel in dropdown_selectors:
-        try:
-            await page.wait_for_selector(sel,timeout=8000)
-            await page.locator(sel).click(force=True)
-            await wait(2)
-            break
-        except: continue
+async def click_advance_search(page: Page):
+    await wait(30, "for dashboard to load fully after login")
+    await safe_click(page,
+        ["button[data-bs-target='#collapse-advance-serach']",
+         "button.btn.btn-warning",
+         "text=/Advance\\s*search/i"],
+        "Advance search", wait_after=30)
+    logger.info("✅ Advance Search expanded successfully")
+
+async def perform_logout(page: Page):
+    logger.info("🔒 Starting logout...")
+    await wait(10)
+    await safe_click(page,
+        ["span.k-menu-expand-arrow", "a.k-menu-link.k-active", "text=/Welcome/i"],
+        "Profile dropdown", wait_after=2)
+    await safe_click(page, ["text=/Logout/i"], "Logout", wait_after=5)
     try:
-        await page.click("text='Logout'",timeout=8000)
-        await wait(5)
-        await page.wait_for_selector("text='You are logged-out successfully!!!'",timeout=10000)
-        logger.info("✅ Logout successful")
-    except Exception as e:
-        logger.error(f"Logout failed: {e}")
+        await page.wait_for_selector("text='You are logged-out successfully!!!'", timeout=10000)
+        logger.info("✅ Logout confirmed")
+    except Exception:
+        logger.warning("⚠️ Logout confirmation not found")
 
-async def export_dashboard(session_id:str,spreadsheet_id:str,storage_state=None):
-    results=[]
+async def export_dashboard(session_id: str, spreadsheet_id: str, storage_state=None):
+    results = []
     async with async_playwright() as p:
-        browser=await p.chromium.launch(headless=True,args=['--no-sandbox'])
-        context=await browser.new_context(storage_state=storage_state,accept_downloads=True)
-        page=await context.new_page()
-        await page.goto("https://compliancenominationportal.in.pwc.com/dashboard",wait_until="networkidle")
-        await click_advance_search(page)
-        download_path=TMP_DIR/"exports"; download_path.mkdir(exist_ok=True)
+        browser = await p.chromium.launch(headless=True, args=["--no-sandbox"])
+        ctx = await browser.new_context(storage_state=storage_state, accept_downloads=True)
+        page = await ctx.new_page()
+        await page.goto("https://compliancenominationportal.in.pwc.com/dashboard", wait_until="networkidle")
+        logger.info("🌐 Dashboard loaded, waiting before clicking Advance Search...")
+        await wait(30, "for full dashboard load")
+        try:
+            await click_advance_search(page)
+        except Exception as e:
+            logger.error(f"🚫 Critical failure: Advance Search not clickable, stopping export. Reason: {e}")
+            await browser.close()
+            return {
+                "ok": False,
+                "error": "Advance Search not clickable — export aborted",
+                "details": str(e)
+            }
+        logger.info("✅ Proceeding to tab exports after successful Advance Search...")
+        ddir = TMP_DIR / "exports"; ddir.mkdir(exist_ok=True)
         for tab in DASHBOARD_TABS:
-            results.append(await export_tab(page,tab,spreadsheet_id,download_path))
+            results.append(await export_tab(page, tab, spreadsheet_id, ddir))
         await perform_logout(page)
         await browser.close()
-    return {"ok":True,"tabs":results}
+    return {
+        "ok": True,
+        "tabs": results,
+        "successful": [r for r in results if "error" not in r],
+        "failed": [r for r in results if "error" in r]
+    }
 
 class ExportRequest(BaseModel):
-    session_id:str="latest"
-    spreadsheet_id:str=None
-    storage_state:dict|None=None
+    session_id: str = "latest"
+    spreadsheet_id: str | None = None
+    storage_state: dict | None = None
 
 @app.post("/export-dashboard")
-async def run_export(req:ExportRequest):
-    sid=req.session_id or "latest"
-    sid_val=req.spreadsheet_id or GOOGLE_SHEET_ID
-    if not sid_val: raise HTTPException(400,"Missing spreadsheet id")
-    result=await export_dashboard(sid,sid_val,req.storage_state)
+async def run_export(req: ExportRequest):
+    sid = req.session_id or "latest"
+    sheet = req.spreadsheet_id or GOOGLE_SHEET_ID
+    if not sheet:
+        raise HTTPException(400, "spreadsheet_id required")
+    result = await export_dashboard(sid, sheet, req.storage_state)
     return JSONResponse(content=result)
 
 @app.get("/health")
-async def health(): return {"ok":True,"uptime":datetime.now().isoformat()}
+async def health():
+    return {"ok": True, "timestamp": datetime.now().isoformat()}
 
-if __name__=="__main__":
-    import uvicorn; uvicorn.run(app,host="0.0.0.0",port=int(os.getenv("PORT",8000)))
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", 8000)))
