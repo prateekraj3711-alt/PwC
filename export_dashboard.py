@@ -27,6 +27,9 @@ logger = logging.getLogger(__name__)
 
 app = FastAPI(title="PwC Dashboard Export API")
 
+# Track start time for uptime
+start_time = datetime.now()
+
 # Environment variables
 GOOGLE_SHEET_ID = os.getenv("GOOGLE_SHEET_ID")
 GOOGLE_CREDENTIALS_JSON = os.getenv("GOOGLE_CREDENTIALS_JSON")
@@ -693,8 +696,19 @@ async def root():
         "message": "PwC Dashboard Export API",
         "endpoints": {
             "POST /export-dashboard": "Export dashboard tabs to Google Sheets with incremental sync",
-            "GET /test-sheets": "Test Google Sheets connectivity and write a test row"
+            "GET /test-sheets": "Test Google Sheets connectivity and write a test row",
+            "GET /health": "Health check with uptime"
         }
+    }
+
+
+@app.get("/health")
+async def health():
+    """Health check endpoint with uptime"""
+    uptime_seconds = int((datetime.now() - start_time).total_seconds())
+    return {
+        "ok": True,
+        "uptime": uptime_seconds
     }
 
 
