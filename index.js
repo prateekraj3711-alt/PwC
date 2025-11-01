@@ -821,20 +821,41 @@ app.post('/complete-login', async (req, res) => {
       try {
         // Read the session storage state to send it directly
         let storageStateData = null;
+        let storageStateObj = null;
         try {
           const sessionPath = await getSessionPath(effectiveSessionId);
           storageStateData = await fs.readFile(sessionPath, 'utf-8');
+          
+          // CRITICAL: Parse JSON string to object (not send as string)
+          if (storageStateData) {
+            storageStateObj = JSON.parse(storageStateData);
+            console.log(`[Auto-Export] Loaded storage_state with ${storageStateObj?.cookies?.length || 0} cookies`);
+            
+            // Validate it's an object with expected structure
+            if (!storageStateObj || typeof storageStateObj !== 'object' || Array.isArray(storageStateObj)) {
+              throw new Error('storage_state is not a valid object');
+            }
+          }
         } catch (readErr) {
-          console.warn(`[Auto-Export] Could not read session file: ${readErr.message}`);
+          console.warn(`[Auto-Export] Could not read/parse session file: ${readErr.message}`);
+        }
+        
+        // Build request body - storage_state MUST be an object, not a string
+        const requestBody = { 
+          session_id: effectiveSessionId,
+          storage_state: storageStateObj  // Send as object, not string!
+        };
+        
+        // Verify before sending
+        if (requestBody.storage_state && typeof requestBody.storage_state === 'string') {
+          console.error('[Auto-Export] ERROR: storage_state is a string! Should be an object.');
+          throw new Error('storage_state must be an object, not a string');
         }
         
         const exportResponse = await fetch(`${exportServiceUrl}/export-dashboard`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ 
-            session_id: effectiveSessionId,
-            storage_state: storageStateData ? JSON.parse(storageStateData) : null
-          })
+          body: JSON.stringify(requestBody)
         });
         const exportResult = await exportResponse.json().catch(() => null);
         if (exportResult && exportResult.ok) {
