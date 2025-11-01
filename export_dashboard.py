@@ -10,7 +10,7 @@ import pandas as pd
 import requests
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import JSONResponse, FileResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, field_validator
 from playwright.async_api import async_playwright, Page, Download
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
@@ -267,12 +267,176 @@ async def export_dashboard(session_id: str, spreadsheet_id: str, storage_state: 
             except FileNotFoundError:
                 logger.warning(f"Session file missing locally for {session_id}")
                 raise FileNotFoundError(f"Session file not found: {session_file}. Please provide storage_state in request or ensure session file exists.")
+        
+        # CRITICAL: Ensure storage_state is a dict, not a string
+        # If it came as a JSON string, parse it
+        if isinstance(storage_state, str):
+            logger.warning("storage_state received as string, parsing JSON...")
+            try:
+                storage_state = json.loads(storage_state)
+                logger.info("✅ Successfully parsed storage_state from string")
+            except json.JSONDecodeError as parse_err:
+                raise ValueError(f"storage_state is a string but not valid JSON: {parse_err}")
+        
+        # Validate storage_state structure (must be a dict with expected Playwright structure)
+        if not isinstance(storage_state, dict):
+            raise TypeError(f"storage_state must be a dict or JSON string, got {type(storage_state)}")
+        
+        # Validate it has Playwright storage state structure
+        if "cookies" not in storage_state and "origins" not in storage_state:
+            logger.warning("⚠️ storage_state missing 'cookies' or 'origins' - might be invalid")
+            # Log structure for debugging
+            logger.debug(f"storage_state keys: {list(storage_state.keys()) if isinstance(storage_state, dict) else 'N/A'}")
+        
+        logger.info(f"✅ Using storage_state with {len(storage_state.get('cookies', []))} cookies")
 
         async with async_playwright() as p:
             browser = await p.chromium.launch(headless=True, args=["--no-sandbox"])
             context = await browser.new_context(storage_state=storage_state, accept_downloads=True)
             page = await context.new_page()
-            await page.goto("https://compliancenominationportal.in.pwc.com/dashboard", wait_until="networkidle")
+            
+            # Navigate to dashboard with error detection
+            logger.info("Navigating to dashboard...")
+            await page.goto("https://compliancenominationportal.in.pwc.com/dashboard", wait_until="networkidle", timeout=60000)
+            await asyncio.sleep(3)
+            
+            # Check for error page
+            current_url = page.url
+            logger.info(f"📍 Current URL after navigation: {current_url}")
+            
+            if "ErrorPage" in current_url or "Oops" in current_url:
+                logger.warning("Detected error page, trying alternative navigation...")
+                error_screenshot = f"/tmp/error_page_{datetime.now().strftime('%H%M%S')}.png"
+                await page.screenshot(path=error_screenshot, full_page=True)
+                logger.error(f"❌ Error page detected: {current_url}. Screenshot: {error_screenshot}")
+                
+                # Try navigating to home page first, then dashboard
+                try:
+                    logger.info("Attempting navigation via home page...")
+                    await page.goto("https://compliancenominationportal.in.pwc.com", wait_until="networkidle", timeout=30000)
+                    await asyncio.sleep(3)
+                    
+                    # Try clicking dashboard link if it exists
+                    dashboard_clicked = await try_click_selector(page, [
+                        'a[href*="dashboard"]',
+                        'a:has-text("Dashboard")',
+                        'text="Dashboard"',
+                        'a:has-text("Home")',
+                        'text="Home"'
+                    ], timeout_per=5000)
+                    
+                    if dashboard_clicked:
+                        await page.wait_for_load_state("networkidle", timeout=30000)
+                        await asyncio.sleep(3)
+                        current_url = page.url
+                        logger.info(f"📍 Navigated via link to: {current_url}")
+                    
+                    # If still on error page, try direct URL again
+                    if "ErrorPage" in page.url or "Oops" in page.url:
+                        logger.warning("Still on error page, trying direct dashboard URL again...")
+                        await page.goto("https://compliancenominationportal.in.pwc.com/dashboard", wait_until="networkidle", timeout=30000)
+                        await asyncio.sleep(3)
+                        
+                except Exception as nav_err:
+                    logger.error(f"Alternative navigation failed: {nav_err}")
+            
+            # Final check - verify we're on dashboard, not error page
+            final_url = page.url
+            logger.info(f"📍 Final URL before validation: {final_url}")
+            
+            # Check for error page in URL
+            if "ErrorPage" in final_url or "Oops" in final_url:
+                error_screenshot = f"/tmp/final_error_page_{datetime.now().strftime('%H%M%S')}.png"
+                await page.screenshot(path=error_screenshot, full_page=True)
+                page_text = await page.locator('body').inner_text()
+                
+                # Check if session might be invalid
+                if "not found" in page_text.lower() or "error" in page_text.lower():
+                    raise Exception(
+                        f"❌ Unable to access dashboard - stuck on error page. "
+                        f"This usually means:\n"
+                        f"1. Session expired or invalid\n"
+                        f"2. User doesn't have dashboard access\n"
+                        f"3. Dashboard URL requires authentication that session lacks\n\n"
+                        f"URL: {final_url}\n"
+                        f"Screenshot: {error_screenshot}\n"
+                        f"Please verify the session is valid and try logging in again."
+                    )
+                else:
+                    raise Exception(f"Unable to access dashboard - stuck on error page: {final_url}. Screenshot: {error_screenshot}")
+            
+            # Check if page has dashboard content
+            try:
+                page_title = await page.title()
+                page_text = await page.locator('body').inner_text()
+                
+                # More thorough error detection
+                error_indicators = [
+                    "not found" in page_text.lower(),
+                    "error" in page_title.lower(),
+                    "sorry" in page_text.lower() and "error" in page_text.lower(),
+                    "requested page not found" in page_text.lower()
+                ]
+                
+                if any(error_indicators):
+                    error_screenshot = f"/tmp/dashboard_error_{datetime.now().strftime('%H%M%S')}.png"
+                    await page.screenshot(path=error_screenshot, full_page=True)
+                    raise Exception(
+                        f"Dashboard page appears to have error content. "
+                        f"URL: {final_url}\n"
+                        f"Page title: {page_title}\n"
+                        f"Screenshot: {error_screenshot}"
+                    )
+            except Exception as check_err:
+                # If we can't check page content, at least verify URL is correct
+                if "ErrorPage" not in final_url and "Oops" not in final_url:
+                    logger.warning(f"Could not verify page content but URL looks OK: {check_err}")
+                else:
+                    raise check_err
+            
+            # Verify we're actually on dashboard (not just not on error page)
+            if "/dashboard" not in final_url and "compliancenominationportal" in final_url:
+                logger.warning(f"Not on dashboard URL, but also not on error page: {final_url}")
+                # Try to navigate to dashboard one more time
+                try:
+                    await page.goto("https://compliancenominationportal.in.pwc.com/dashboard", wait_until="networkidle", timeout=30000)
+                    await asyncio.sleep(3)
+                    final_url = page.url
+                    if "ErrorPage" in final_url or "Oops" in final_url:
+                        error_screenshot = f"/tmp/dashboard_nav_failed_{datetime.now().strftime('%H%M%S')}.png"
+                        await page.screenshot(path=error_screenshot, full_page=True)
+                        raise Exception(f"Final navigation to dashboard failed. URL: {final_url}. Screenshot: {error_screenshot}")
+                except Exception as nav_err:
+                    if "ErrorPage" in str(nav_err) or "Oops" in str(nav_err):
+                        raise
+                    logger.warning(f"Dashboard navigation warning: {nav_err}")
+            
+            # CRITICAL: Final validation before proceeding - must not be on error page
+            final_check_url = page.url
+            if "ErrorPage" in final_check_url or "Oops" in final_check_url:
+                error_screenshot = f"/tmp/pre_advance_search_error_{datetime.now().strftime('%H%M%S')}.png"
+                await page.screenshot(path=error_screenshot, full_page=True)
+                page_text_final = await page.locator('body').inner_text()
+                raise Exception(
+                    f"❌ CRITICAL: Still on error page when trying to click Advance Search!\n"
+                    f"This means the session cannot access the dashboard.\n\n"
+                    f"Possible causes:\n"
+                    f"1. Session expired or invalid\n"
+                    f"2. User account doesn't have dashboard access permissions\n"
+                    f"3. Dashboard URL changed or requires different authentication\n"
+                    f"4. Session storage_state is missing required cookies/state\n\n"
+                    f"Current URL: {final_check_url}\n"
+                    f"Page contains: {page_text_final[:200]}...\n"
+                    f"Screenshot: {error_screenshot}\n\n"
+                    f"Action: Please verify login session is valid and user has dashboard access."
+                )
+            
+            # Verify URL actually contains dashboard
+            if "/dashboard" not in final_check_url.lower():
+                logger.warning(f"⚠️ URL doesn't contain '/dashboard': {final_check_url}")
+                # This might be OK if it's a redirect, but log it
+            
+            logger.info("✅ Successfully navigated to dashboard - URL validated")
             await click_advance_search(page)
 
             download_dir = TMP_DIR / "dashboard_exports"
@@ -301,6 +465,22 @@ class ExportRequest(BaseModel):
     session_id: str
     spreadsheet_id: Optional[str] = None
     storage_state: Optional[Dict] = None
+    
+    @field_validator('storage_state', mode='before')
+    @classmethod
+    def parse_storage_state(cls, v):
+        """Ensure storage_state is always a dict, not a string"""
+        if v is None:
+            return None
+        if isinstance(v, str):
+            # If it came as a string (double-encoded), parse it
+            try:
+                return json.loads(v)
+            except json.JSONDecodeError:
+                raise ValueError(f"storage_state is a string but not valid JSON")
+        if isinstance(v, dict):
+            return v
+        raise ValueError(f"storage_state must be a dict or JSON string, got {type(v)}")
 
 
 @app.post("/export-dashboard")
@@ -308,7 +488,31 @@ async def export_endpoint(req: ExportRequest):
     spreadsheet_id = req.spreadsheet_id or GOOGLE_SHEET_ID
     if not spreadsheet_id:
         raise HTTPException(status_code=400, detail="spreadsheet_id required (set GOOGLE_SHEET_ID env or provide in request)")
-    result = await export_dashboard(req.session_id, spreadsheet_id, req.storage_state)
+    
+    # Handle storage_state - ensure it's properly formatted
+    storage_state = req.storage_state
+    if storage_state:
+        # If Pydantic received it as a string (due to JSON double-encoding), parse it
+        if isinstance(storage_state, str):
+            try:
+                storage_state = json.loads(storage_state)
+                logger.info("✅ Parsed storage_state from string in request")
+            except json.JSONDecodeError:
+                raise HTTPException(
+                    status_code=400,
+                    detail="storage_state is a string but not valid JSON. Ensure Node.js sends it as an object, not a stringified JSON."
+                )
+        
+        # Validate it's a dict
+        if not isinstance(storage_state, dict):
+            raise HTTPException(
+                status_code=400,
+                detail=f"storage_state must be a dict or valid JSON string, got {type(storage_state)}"
+            )
+        
+        logger.info(f"✅ Received storage_state with {len(storage_state.get('cookies', []))} cookies")
+    
+    result = await export_dashboard(req.session_id, spreadsheet_id, storage_state)
     return JSONResponse(content=result)
 
 
