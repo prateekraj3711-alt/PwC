@@ -7,12 +7,13 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libasound2 libatk-bridge2.0-0 libcups2 libdbus-1-3 \
     libdrm2 libgbm1 libgtk-3-0 libnspr4 libnss3 \
     libx11-xcb1 libxcomposite1 libxdamage1 libxrandr2 \
-    xdg-utils && rm -rf /var/lib/apt/lists/*
+    xdg-utils fonts-noto-color-emoji fonts-liberation && \
+    rm -rf /var/lib/apt/lists/*
 
 # ===== Set Working Directory =====
 WORKDIR /app
 
-# ===== Copy Requirements First (for build cache) =====
+# ===== Copy Requirements First =====
 COPY requirements.txt ./requirements.txt
 
 # ===== Install Python Dependencies =====
@@ -20,11 +21,10 @@ RUN pip install --upgrade pip setuptools wheel
 RUN pip install --prefer-binary -r requirements.txt
 
 # ===== Install Playwright and Chromium =====
-# The deps step ensures Playwright doesn’t fail if Render base image changes
-RUN python -m playwright install-deps chromium && python -m playwright install chromium
+RUN python -m playwright install chromium
 
 # ===== Copy Application Code =====
-COPY . ./
+COPY . .
 
 # ===== Environment Config =====
 ENV PORT=8000
