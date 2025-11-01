@@ -497,7 +497,7 @@ async def export_dashboard_tab(
         return None
 
 
-async def export_dashboard(session_id: str, spreadsheet_id: str) -> Dict:
+async def export_dashboard(session_id: str, spreadsheet_id: str, storage_state: Optional[Dict] = None) -> Dict:
     """
     Main orchestration function to export all dashboard tabs with incremental sync
     
@@ -511,24 +511,87 @@ async def export_dashboard(session_id: str, spreadsheet_id: str) -> Dict:
     tab_results = []
     
     try:
-        if session_id == "latest":
-            session_dir = Path(SESSION_STORAGE_PATH)
-            session_files = sorted(
-                session_dir.glob("*.json"),
-                key=lambda p: p.stat().st_mtime,
-                reverse=True
-            )
-            if not session_files:
-                raise FileNotFoundError("No session files found")
-            session_storage_file = session_files[0]
-            logger.info(f"Using latest session: {session_storage_file.name}")
+        # Priority 1: Use storage_state from request body (best for Render - separate containers)
+        if storage_state:
+            logger.info(f"Using storage_state provided in request for session {session_id}")
         else:
-            session_storage_file = Path(SESSION_STORAGE_PATH) / f"{session_id}.json"
-            if not session_storage_file.exists():
-                raise FileNotFoundError(f"Session storage not found: {session_storage_file}")
-        
-        with open(session_storage_file, 'r') as f:
-            storage_state = json.load(f)
+            # Priority 2: Try to load from file system (fallback for local testing or shared storage)
+            session_paths_to_try = [
+                Path(SESSION_STORAGE_PATH),
+                Path("/tmp/pwc"),
+                Path("/opt/render/project/src/tmp/pwc"),
+                Path.cwd() / "tmp" / "pwc"
+            ]
+            
+            session_storage_file = None
+            
+            if session_id == "latest":
+                # Try to find latest session file across all possible paths
+                for base_path in session_paths_to_try:
+                    try:
+                        if base_path.exists():
+                            session_files = sorted(
+                                base_path.glob("*.json"),
+                                key=lambda p: p.stat().st_mtime,
+                                reverse=True
+                            )
+                            if session_files:
+                                session_storage_file = session_files[0]
+                                logger.info(f"Using latest session: {session_storage_file} (from {base_path})")
+                                break
+                    except Exception as e:
+                        logger.debug(f"Could not check {base_path}: {e}")
+                        continue
+                
+                if not session_storage_file:
+                    # Retry after a short delay (session might still be saving)
+                    logger.info("Session file not found immediately, waiting 3 seconds and retrying...")
+                    await asyncio.sleep(3)
+                    
+                    for base_path in session_paths_to_try:
+                        try:
+                            if base_path.exists():
+                                session_files = sorted(
+                                    base_path.glob("*.json"),
+                                    key=lambda p: p.stat().st_mtime,
+                                    reverse=True
+                                )
+                                if session_files:
+                                    session_storage_file = session_files[0]
+                                    logger.info(f"Using latest session (after retry): {session_storage_file} (from {base_path})")
+                                    break
+                        except Exception as e:
+                            continue
+                    
+                    if not session_storage_file:
+                        raise FileNotFoundError(f"No session files found in any of: {[str(p) for p in session_paths_to_try]}")
+            else:
+                # Try specific session ID across all possible paths
+                for base_path in session_paths_to_try:
+                    candidate = base_path / f"{session_id}.json"
+                    if candidate.exists():
+                        session_storage_file = candidate
+                        logger.info(f"Found session file: {session_storage_file}")
+                        break
+                
+                if not session_storage_file:
+                    # Retry after a short delay
+                    logger.info(f"Session file not found immediately, waiting 3 seconds and retrying for {session_id}...")
+                    await asyncio.sleep(3)
+                    
+                    for base_path in session_paths_to_try:
+                        candidate = base_path / f"{session_id}.json"
+                        if candidate.exists():
+                            session_storage_file = candidate
+                            logger.info(f"Found session file (after retry): {session_storage_file}")
+                            break
+                    
+                    if not session_storage_file:
+                        raise FileNotFoundError(f"Session storage not found: {session_id}.json in any of: {[str(p) for p in session_paths_to_try]}")
+            
+            # Load storage_state from file
+            with open(session_storage_file, 'r') as f:
+                storage_state = json.load(f)
         
         download_path = TMP_DIR / "dashboard_exports"
         download_path.mkdir(parents=True, exist_ok=True)
@@ -687,6 +750,7 @@ async def export_dashboard(session_id: str, spreadsheet_id: str) -> Dict:
 class ExportRequest(BaseModel):
     session_id: Optional[str] = "latest"
     spreadsheet_id: Optional[str] = None
+    storage_state: Optional[Dict] = None
 
 
 @app.get("/")
@@ -725,7 +789,7 @@ async def export_dashboard_endpoint(request: ExportRequest):
                 detail="spreadsheet_id required (set GOOGLE_SHEET_ID env or provide in request)"
             )
         
-        result = await export_dashboard(session_id, sheet_id)
+        result = await export_dashboard(session_id, sheet_id, request.storage_state)
         return JSONResponse(content=result)
         
     except FileNotFoundError as e:
