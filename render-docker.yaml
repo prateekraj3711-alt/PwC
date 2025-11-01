@@ -4,7 +4,6 @@ services:
     env: docker
     dockerfilePath: ./Dockerfile
     dockerContext: .
-    buildCommand: docker build -f Dockerfile -t pwc-export-service .
     plan: free
     autoDeploy: true
     region: oregon
@@ -12,19 +11,15 @@ services:
     envVars:
       - key: PORT
         value: 8000
-      # Google Sheets Integration
       - key: GOOGLE_SHEET_ID
         sync: false
       - key: GOOGLE_CREDENTIALS_JSON
         sync: false
-      # Connection to Login API
       - key: LOGIN_API_BASE_URL
-        sync: false
+        value: https://pwc-login-automation.onrender.com
       - key: INTERNAL_API_TOKEN
         sync: false
-      # Optional Scheduler Controls
       - key: SCHEDULE_ENABLED
         value: true
       - key: SCHEDULE_INTERVAL_MIN
         value: 105
-
