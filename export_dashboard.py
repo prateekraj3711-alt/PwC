@@ -1290,25 +1290,62 @@ async def test_sheets():
     try:
         if not GOOGLE_SHEET_ID:
             raise HTTPException(status_code=400, detail="GOOGLE_SHEET_ID required")
+        
         service = get_sheets_service()
         test_row = ["✅ Connection test", datetime.now().isoformat()]
+        
+        # First, get spreadsheet metadata to see existing sheets
+        spreadsheet = service.spreadsheets().get(spreadsheetId=GOOGLE_SHEET_ID).execute()
+        sheets = spreadsheet.get('sheets', [])
+        
         sheet_name = "TestConnection"
-        range_name = f"{sheet_name}!A:B"
-        service.spreadsheets().values().append(
+        sheet_id = None
+        
+        # Check if sheet exists
+        for sheet in sheets:
+            if sheet['properties']['title'] == sheet_name:
+                sheet_id = sheet['properties']['sheetId']
+                break
+        
+        # Create sheet if it doesn't exist
+        if sheet_id is None:
+            logger.info(f"Creating new sheet: {sheet_name}")
+            add_sheet_request = {
+                'addSheet': {
+                    'properties': {
+                        'title': sheet_name
+                    }
+                }
+            }
+            batch_update = service.spreadsheets().batchUpdate(
+                spreadsheetId=GOOGLE_SHEET_ID,
+                body={'requests': [add_sheet_request]}
+            ).execute()
+            sheet_id = batch_update['replies'][0]['addSheet']['properties']['sheetId']
+            logger.info(f"✅ Created sheet {sheet_name} (ID: {sheet_id})")
+        
+        # Write test row to the sheet
+        range_name = f"{sheet_name}!A1:B1"
+        result = service.spreadsheets().values().append(
             spreadsheetId=GOOGLE_SHEET_ID,
             range=range_name,
             valueInputOption="RAW",
+            insertDataOption="INSERT_ROWS",
             body={"values": [test_row]},
         ).execute()
+        
         logger.info(f"✅ Test row written to {GOOGLE_SHEET_ID} / {sheet_name}")
         return JSONResponse(content={
             "ok": True,
             "message": "Write test successful",
             "spreadsheet_id": GOOGLE_SHEET_ID,
-            "sheet": sheet_name
+            "sheet": sheet_name,
+            "updated_cells": result.get('updates', {}).get('updatedCells', 0)
         })
     except Exception as e:
         logger.error(f"Test Sheets error: {e}")
+        import traceback
+        logger.error(f"Traceback: {traceback.format_exc()}")
         raise HTTPException(status_code=500, detail=f"Test failed: {e}")
 
 
