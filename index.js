@@ -251,11 +251,31 @@ async function cleanupOldSessions() {
 // Helper function to destroy all existing browser contexts
 async function destroyAllBrowserContexts() {
   try {
-    // Close all existing browser sessions
+    // First, try to log out from PwC before closing browsers
+    const logoutPromises = [];
+    for (const [sessionId, session] of sessions.entries()) {
+      try {
+        if (session.page && !session.page.isClosed()) {
+          // Try to navigate to logout URL
+          logoutPromises.push(
+            session.page.goto('https://compliancenominationportal.in.pwc.com/Account/LogOff', { timeout: 10000 }).catch(() => {})
+          );
+        }
+      } catch (e) {
+        // Ignore errors
+      }
+    }
+    
+    // Wait for logout attempts (don't wait too long)
+    await Promise.allSettled(logoutPromises);
+    await new Promise(resolve => setTimeout(resolve, 2000)); // Brief wait for logout
+    
+    // Now close all browsers
+    const closePromises = [];
     for (const [sessionId, session] of sessions.entries()) {
       try {
         if (session.browser) {
-          await session.browser.close().catch(() => {});
+          closePromises.push(session.browser.close().catch(() => {}));
         }
       } catch (e) {
         // Ignore errors
@@ -263,16 +283,25 @@ async function destroyAllBrowserContexts() {
       sessions.delete(sessionId);
     }
     
+    // Wait for all browsers to close
+    await Promise.all(closePromises);
+    
     // Also clean up session files
     const baseDir = await ensureTmpDir();
     const files = await fs.readdir(baseDir).catch(() => []);
+    const deletePromises = [];
     for (const file of files) {
       if (file.endsWith('.json')) {
-        await fs.unlink(path.join(baseDir, file)).catch(() => {});
+        deletePromises.push(fs.unlink(path.join(baseDir, file)).catch(() => {}));
       }
     }
+    await Promise.all(deletePromises);
     
-    console.log('[Session Isolation] Destroyed all existing browser contexts and session files');
+    // CRITICAL: Wait longer (10 seconds) for PwC server to recognize all sessions are closed
+    // This ensures no concurrent session conflicts
+    await new Promise(resolve => setTimeout(resolve, 10000));
+    
+    console.log('[Session Isolation] Destroyed all existing browser contexts and session files. Waited 10s for PwC server to recognize closure.');
   } catch (err) {
     console.warn(`[Session Isolation] Error destroying contexts: ${err.message}`);
   }
@@ -904,7 +933,11 @@ app.post('/complete-login', async (req, res) => {
 
     const exportServiceUrl = process.env.EXPORT_SERVICE_URL || 'http://localhost:8000';
     
-    // Wait a moment for session file to be written
+    // CRITICAL: Wait even longer (30 seconds) to ensure:
+    // 1. Session file is fully written
+    // 2. All previous browser contexts are fully closed
+    // 3. PwC server has time to recognize old sessions are gone (critical for AccessDeniedConcurrent)
+    // 4. Node.js has already destroyed all old contexts (10s wait in destroyAllBrowserContexts)
     setTimeout(async () => {
       try {
         // Read the session storage state to send it directly
@@ -926,6 +959,7 @@ app.post('/complete-login', async (req, res) => {
           }
         } catch (readErr) {
           console.warn(`[Auto-Export] Could not read/parse session file: ${readErr.message}`);
+          return; // Don't proceed if we can't read the session
         }
         
         // Build request body - storage_state MUST be an object, not a string
@@ -940,6 +974,7 @@ app.post('/complete-login', async (req, res) => {
           throw new Error('storage_state must be an object, not a string');
         }
         
+        console.log(`[Auto-Export] Triggering export for session ${effectiveSessionId}...`);
         const exportResponse = await fetch(`${exportServiceUrl}/export-dashboard`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
@@ -947,14 +982,14 @@ app.post('/complete-login', async (req, res) => {
         });
         const exportResult = await exportResponse.json().catch(() => null);
         if (exportResult && exportResult.ok) {
-          console.log(`[Auto-Export] Completed for session ${effectiveSessionId}`);
+          console.log(`[Auto-Export] ✅ Completed for session ${effectiveSessionId}`);
         } else {
-          console.warn(`[Auto-Export] Failed for session ${effectiveSessionId}: ${exportResult?.error || 'Unknown error'}`);
+          console.warn(`[Auto-Export] ⚠️ Failed for session ${effectiveSessionId}: ${exportResult?.error || exportResult?.detail || 'Unknown error'}`);
         }
       } catch (exportErr) {
-        console.error(`[Auto-Export] Error: ${exportErr.message}`);
+        console.error(`[Auto-Export] ❌ Error: ${exportErr.message}`);
       }
-    }, 2000); // Wait 2 seconds for file to be written
+    }, 30000); // Wait 30 seconds total (10s in destroyAllBrowserContexts + 20s here = 30s)
 
     return res.status(200).json({
       ok: true,
