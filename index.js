@@ -983,19 +983,53 @@ app.post('/complete-login', async (req, res) => {
         }
         
         console.log(`[Auto-Export] Triggering export for session ${effectiveSessionId}...`);
-        const exportResponse = await fetch(`${exportServiceUrl}/export-dashboard`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify(requestBody)
-        });
-        const exportResult = await exportResponse.json().catch(() => null);
-        if (exportResult && exportResult.ok) {
-          console.log(`[Auto-Export] ✅ Completed for session ${effectiveSessionId}`);
-        } else {
-          console.warn(`[Auto-Export] ⚠️ Failed for session ${effectiveSessionId}: ${exportResult?.error || exportResult?.detail || 'Unknown error'}`);
+        console.log(`[Auto-Export] Export service URL: ${exportServiceUrl}/export-dashboard`);
+        
+        // Add timeout to fetch (30 seconds)
+        const controller = new AbortController();
+        const timeoutId = setTimeout(() => controller.abort(), 30000);
+        
+        try {
+          const exportResponse = await fetch(`${exportServiceUrl}/export-dashboard`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(requestBody),
+            signal: controller.signal
+          });
+          clearTimeout(timeoutId);
+          
+          const exportResult = await exportResponse.json().catch(() => null);
+          if (exportResult && exportResult.ok) {
+            console.log(`[Auto-Export] ✅ Completed for session ${effectiveSessionId}`);
+          } else {
+            console.warn(`[Auto-Export] ⚠️ Failed for session ${effectiveSessionId}: ${exportResult?.error || exportResult?.detail || exportResponse?.status || 'Unknown error'}`);
+            if (exportResponse && !exportResponse.ok) {
+              console.warn(`[Auto-Export] HTTP Status: ${exportResponse.status} ${exportResponse.statusText}`);
+            }
+          }
+        } catch (fetchErr) {
+          clearTimeout(timeoutId);
+          
+          // Detailed error logging
+          if (fetchErr.name === 'AbortError') {
+            console.error(`[Auto-Export] ❌ Timeout (30s) connecting to ${exportServiceUrl}`);
+          } else if (fetchErr.code === 'ECONNREFUSED') {
+            console.error(`[Auto-Export] ❌ Connection refused to ${exportServiceUrl}. Service may not be running or URL is incorrect.`);
+            console.error(`[Auto-Export] 💡 Check: EXPORT_SERVICE_URL environment variable is set correctly (must be public URL on Render, not localhost)`);
+          } else if (fetchErr.code === 'ENOTFOUND' || fetchErr.code === 'EAI_AGAIN') {
+            console.error(`[Auto-Export] ❌ DNS resolution failed for ${exportServiceUrl}. URL may be incorrect.`);
+          } else if (fetchErr.message && fetchErr.message.includes('fetch failed')) {
+            console.error(`[Auto-Export] ❌ Network error: ${fetchErr.message}`);
+            console.error(`[Auto-Export] Error code: ${fetchErr.code || 'N/A'}, cause: ${fetchErr.cause || 'N/A'}`);
+            console.error(`[Auto-Export] 💡 Ensure EXPORT_SERVICE_URL is set to the Python service's public URL (e.g., https://your-python-service.onrender.com)`);
+          } else {
+            console.error(`[Auto-Export] ❌ Error: ${fetchErr.message}`);
+            console.error(`[Auto-Export] Error details: ${JSON.stringify({ code: fetchErr.code, cause: fetchErr.cause, name: fetchErr.name })}`);
+          }
         }
       } catch (exportErr) {
-        console.error(`[Auto-Export] ❌ Error: ${exportErr.message}`);
+        console.error(`[Auto-Export] ❌ Unexpected error: ${exportErr.message}`);
+        console.error(`[Auto-Export] Stack: ${exportErr.stack}`);
       }
     }, 60000); // Wait 60 seconds to ensure PwC server recognizes Node.js session is closed
 
