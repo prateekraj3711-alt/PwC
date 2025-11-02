@@ -931,22 +931,37 @@ async def export_dashboard(session_id: str, spreadsheet_id: str, storage_state: 
             await browser.close()
             
             # STEP 3: Upload all exported Excel files to Google Sheets
+            logger.info(f"\n{'='*70}")
+            logger.info(f"🔍 STEP 3: Checking Google Sheets configuration...")
+            logger.info(f"📋 spreadsheet_id provided: {spreadsheet_id}")
+            logger.info(f"📋 GOOGLE_SHEET_ID env var: {GOOGLE_SHEET_ID}")
+            logger.info(f"📋 GOOGLE_CREDENTIALS_JSON set: {'Yes' if GOOGLE_CREDENTIALS_JSON else 'No'}")
+            logger.info(f"{'='*70}\n")
+            
             if spreadsheet_id:
-                logger.info(f"\n{'='*70}")
                 logger.info(f"📤 STEP 3: Uploading exported Excel files to Google Sheets...")
-                logger.info(f"{'='*70}\n")
+                logger.info(f"📋 Using spreadsheet_id: {spreadsheet_id}\n")
                 
                 try:
+                    # Verify credentials are available
+                    if not GOOGLE_CREDENTIALS_JSON:
+                        raise ValueError("GOOGLE_CREDENTIALS_JSON environment variable is not set. Please add it in Render environment variables.")
+                    
+                    logger.info(f"✅ Google credentials found, starting upload...")
                     tab_results = await sync_all_tabs_to_sheets(download_dir, spreadsheet_id)
                     logger.info(f"✅ Google Sheets upload completed: {len(tab_results)} tab(s) processed")
                     return {"ok": True, "tabs": results, "sheets_sync": tab_results}
                 except Exception as sync_err:
                     logger.error(f"❌ Google Sheets sync failed: {sync_err}")
+                    logger.error(f"❌ Error type: {type(sync_err).__name__}")
+                    import traceback
+                    logger.error(f"❌ Error traceback: {traceback.format_exc()}")
                     logger.error(f"Export completed but Sheets sync failed - files saved in {download_dir}")
-                    return {"ok": True, "tabs": results, "sheets_sync_error": str(sync_err)}
+                    return {"ok": True, "tabs": results, "sheets_sync_error": str(sync_err), "error_type": type(sync_err).__name__}
             else:
                 logger.warning("⚠️ No GOOGLE_SHEET_ID provided - skipping Google Sheets upload")
-                return {"ok": True, "tabs": results, "sheets_sync": "skipped"}
+                logger.warning("💡 Set GOOGLE_SHEET_ID environment variable in Render to enable Sheets upload")
+                return {"ok": True, "tabs": results, "sheets_sync": "skipped", "reason": "GOOGLE_SHEET_ID not set"}
 
     except Exception as e:
         logger.error(f"Export error: {e}")
