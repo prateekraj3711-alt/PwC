@@ -438,42 +438,47 @@ async def export_dashboard(session_id: str, spreadsheet_id: str, storage_state: 
         async with async_playwright() as p:
             browser = await p.chromium.launch(headless=True, args=["--no-sandbox"])
             
-            # CRITICAL: Start fresh - don't use storage_state initially to clear any concurrent sessions
-            logger.info("🔄 Starting fresh session to clear concurrent logins...")
-            context = await browser.new_context(accept_downloads=True)
-            page = await context.new_page()
+            # CRITICAL: Node.js already destroyed all old contexts and waited 10 seconds
+            # We skip the concurrent session clearing step here to avoid conflicts
+            # Just create the authenticated context directly
+            logger.info("✅ Creating authenticated context with storage_state (Node.js already cleared old sessions)...")
             
-            # Navigate to logout/login page to clear any existing sessions
-            try:
-                logger.info("Clearing any existing concurrent sessions...")
-                await page.goto("https://compliancenominationportal.in.pwc.com/Account/LogOff", wait_until="networkidle", timeout=30000)
-                await asyncio.sleep(2)
-                
-                # Check if we're on logout confirmation or login page
-                current_url = page.url
-                if "LogOff" in current_url or "Login" in current_url or "logout" in current_url.lower():
-                    logger.info("✅ Successfully cleared concurrent session")
-                    await asyncio.sleep(2)
-                else:
-                    logger.warning(f"Unexpected page after logout attempt: {current_url}")
-            except Exception as clear_err:
-                logger.warning(f"Could not clear concurrent session (may not be necessary): {clear_err}")
-            
-            # Close the temporary context and create a new one with storage_state
-            await context.close()
-            logger.info("✅ Creating authenticated context with storage_state...")
-            
-            # Now create context with the storage_state from login
+            # Create context with the storage_state from login
             context = await browser.new_context(storage_state=storage_state, accept_downloads=True)
             page = await context.new_page()
             
             # Wait a moment for context to initialize
-            await asyncio.sleep(2)
+            await asyncio.sleep(3)
             
             # CRITICAL: Validate session before proceeding - check for AccessDeniedConcurrent
             logger.info("🔍 Validating session before navigation...")
+            
+            # First, navigate to home page to clear any stale state
+            try:
+                logger.info("Navigating to home page first to clear any stale state...")
+                await page.goto("https://compliancenominationportal.in.pwc.com", wait_until="networkidle", timeout=30000)
+                await asyncio.sleep(3)
+                
+                # Check if we got redirected to AccessDeniedConcurrent
+                home_url = page.url
+                if "AccessDeniedConcurrent" in home_url or "/Login/AccessDeniedConcurrent" in home_url:
+                    error_screenshot = f"/tmp/session_expired_home_{datetime.now().strftime('%H%M%S')}.png"
+                    await page.screenshot(path=error_screenshot, full_page=True)
+                    await browser.close()
+                    logger.error(f"❌ Session expired at home page - AccessDeniedConcurrent: {home_url}")
+                    raise HTTPException(
+                        status_code=401,
+                        detail=f"Session expired — please start new login session via Node.js. Detected AccessDeniedConcurrent at home page. URL: {home_url}. Screenshot: {error_screenshot}"
+                    )
+                logger.info("✅ Home page loaded successfully, proceeding to dashboard...")
+            except HTTPException:
+                raise  # Re-raise HTTPException
+            except Exception as home_err:
+                logger.warning(f"Home page navigation warning: {home_err}, continuing to dashboard...")
+            
+            # Now navigate to dashboard
             await page.goto("https://compliancenominationportal.in.pwc.com/BGVAdmin/BGVDashboard", wait_until="networkidle", timeout=60000)
-            await asyncio.sleep(3)
+            await asyncio.sleep(5)  # Increased wait for dashboard to fully load
             
             # Check for error page or concurrent access denial
             current_url = page.url
@@ -487,7 +492,7 @@ async def export_dashboard(session_id: str, spreadsheet_id: str, storage_state: 
                 logger.error(f"❌ Session expired - AccessDeniedConcurrent detected: {current_url}")
                 raise HTTPException(
                     status_code=401,
-                    detail=f"Session expired — please start new login session via Node.js. URL: {current_url}. Screenshot: {error_screenshot}"
+                    detail=f"Session expired — please start new login session via Node.js. AccessDeniedConcurrent detected. This usually means:\n1. Another session is still active on PwC server\n2. Session was not properly cleaned up\n3. Timing issue - wait a few seconds and try again\n\nURL: {current_url}. Screenshot: {error_screenshot}"
                 )
             
             if "ErrorPage" in current_url or "Oops" in current_url:
