@@ -1528,7 +1528,7 @@ app.listen(PORT, '0.0.0.0', () => {});
 // Scheduler: auto-trigger start-login periodically
 let scheduleTimer = null;
 function startScheduler() {
-  const minutes = Number(process.env.SCHEDULE_INTERVAL_MIN || 105);
+  const minutes = Number(process.env.SCHEDULE_INTERVAL_MIN || 240); // Default: 4 hours (240 minutes)
   const ms = Math.max(1, minutes) * 60 * 1000;
   if (scheduleTimer) clearInterval(scheduleTimer);
   scheduleTimer = setInterval(async () => {
