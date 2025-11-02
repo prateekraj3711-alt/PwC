@@ -450,35 +450,10 @@ async def export_dashboard(session_id: str, spreadsheet_id: str, storage_state: 
             # Wait a moment for context to initialize
             await asyncio.sleep(3)
             
-            # CRITICAL: Validate session before proceeding - check for AccessDeniedConcurrent
-            logger.info("🔍 Validating session before navigation...")
-            
-            # First, navigate to home page to clear any stale state
-            try:
-                logger.info("Navigating to home page first to clear any stale state...")
-                await page.goto("https://compliancenominationportal.in.pwc.com", wait_until="networkidle", timeout=30000)
-                await asyncio.sleep(3)
-                
-                # Check if we got redirected to AccessDeniedConcurrent
-                home_url = page.url
-                if "AccessDeniedConcurrent" in home_url or "/Login/AccessDeniedConcurrent" in home_url:
-                    error_screenshot = f"/tmp/session_expired_home_{datetime.now().strftime('%H%M%S')}.png"
-                    await page.screenshot(path=error_screenshot, full_page=True)
-                    await browser.close()
-                    logger.error(f"❌ Session expired at home page - AccessDeniedConcurrent: {home_url}")
-                    raise HTTPException(
-                        status_code=401,
-                        detail=f"Session expired — please start new login session via Node.js. Detected AccessDeniedConcurrent at home page. URL: {home_url}. Screenshot: {error_screenshot}"
-                    )
-                logger.info("✅ Home page loaded successfully, proceeding to dashboard...")
-            except HTTPException:
-                raise  # Re-raise HTTPException
-            except Exception as home_err:
-                logger.warning(f"Home page navigation warning: {home_err}, continuing to dashboard...")
-            
-            # Now navigate to dashboard
+            # CRITICAL: Navigate directly to dashboard (this IS the login URL where authenticated users land)
+            logger.info("🔍 Navigating directly to dashboard to validate session...")
             await page.goto("https://compliancenominationportal.in.pwc.com/BGVAdmin/BGVDashboard", wait_until="networkidle", timeout=60000)
-            await asyncio.sleep(5)  # Increased wait for dashboard to fully load
+            await asyncio.sleep(5)  # Wait for dashboard to fully load
             
             # Check for error page or concurrent access denial
             current_url = page.url
@@ -490,9 +465,24 @@ async def export_dashboard(session_id: str, spreadsheet_id: str, storage_state: 
                 await page.screenshot(path=error_screenshot, full_page=True)
                 await browser.close()
                 logger.error(f"❌ Session expired - AccessDeniedConcurrent detected: {current_url}")
+                
+                # Provide detailed troubleshooting info
+                page_text = await page.locator('body').inner_text() if not page.is_closed() else ""
                 raise HTTPException(
                     status_code=401,
-                    detail=f"Session expired — please start new login session via Node.js. AccessDeniedConcurrent detected. This usually means:\n1. Another session is still active on PwC server\n2. Session was not properly cleaned up\n3. Timing issue - wait a few seconds and try again\n\nURL: {current_url}. Screenshot: {error_screenshot}"
+                    detail=(
+                        f"Session expired — please start new login session via Node.js.\n\n"
+                        f"AccessDeniedConcurrent detected. This means:\n"
+                        f"1. Another session is still active on PwC server (may need manual logout)\n"
+                        f"2. Session storage_state is invalid or expired\n"
+                        f"3. Timing issue - Node.js may need more time to close old sessions\n\n"
+                        f"Recommended actions:\n"
+                        f"- Wait 60+ seconds after Node.js login completes\n"
+                        f"- Manually logout from PwC portal in any browser\n"
+                        f"- Check if scheduler is running (creates new session every 1h45m)\n\n"
+                        f"URL: {current_url}\n"
+                        f"Screenshot: {error_screenshot}"
+                    )
                 )
             
             if "ErrorPage" in current_url or "Oops" in current_url:
