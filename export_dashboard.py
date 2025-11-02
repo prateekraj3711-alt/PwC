@@ -41,10 +41,212 @@ TABS = [
 
 
 def get_sheets_service():
+    if not GOOGLE_CREDENTIALS_JSON:
+        raise ValueError("GOOGLE_CREDENTIALS_JSON environment variable is required")
     creds_json = GOOGLE_CREDENTIALS_JSON
     creds_info = json.loads(creds_json.replace("\\n", "\n")) if "\\n" in creds_json else json.loads(creds_json)
     creds = service_account.Credentials.from_service_account_info(creds_info, scopes=["https://www.googleapis.com/auth/spreadsheets"])
     return build("sheets", "v4", credentials=creds)
+
+
+async def incremental_sync(tab_name: str, excel_path: Path, spreadsheet_id: str, key_col: str = "Candidate ID"):
+    """
+    Incremental sync: Read Excel, compare with existing Google Sheet data, upload new/changed rows.
+    
+    Returns: {"tab": tab_name, "new": count, "updated": count, "skipped": count, "rows": total_rows}
+    """
+    try:
+        logger.info(f"📊 Starting incremental sync for {tab_name}...")
+        
+        # Step 1: Read Excel file
+        if not excel_path.exists():
+            raise FileNotFoundError(f"Excel file not found: {excel_path}")
+        
+        logger.info(f"📖 Reading Excel file: {excel_path}")
+        df_new = pd.read_excel(excel_path, engine='openpyxl')
+        
+        if df_new.empty:
+            logger.warning(f"⚠️ Excel file for {tab_name} is empty")
+            return {"tab": tab_name, "new": 0, "updated": 0, "skipped": 0, "rows": 0, "error": "Excel file is empty"}
+        
+        # Add timestamp column
+        if "LastSyncedAt" not in df_new.columns:
+            df_new["LastSyncedAt"] = datetime.now().isoformat()
+        else:
+            df_new["LastSyncedAt"] = datetime.now().isoformat()
+        
+        logger.info(f"✅ Loaded {len(df_new)} rows from Excel")
+        
+        # Step 2: Read existing data from Google Sheet (if sheet exists)
+        service = get_sheets_service()
+        sheet_name = tab_name  # Use tab name as sheet name
+        
+        try:
+            # Check if sheet exists
+            spreadsheet = service.spreadsheets().get(spreadsheetId=spreadsheet_id).execute()
+            sheet_exists = any(s.get('properties', {}).get('title') == sheet_name for s in spreadsheet.get('sheets', []))
+            
+            if sheet_exists and key_col in df_new.columns:
+                # Read existing data
+                logger.info(f"📥 Reading existing data from sheet '{sheet_name}'...")
+                try:
+                    result = service.spreadsheets().values().get(
+                        spreadsheetId=spreadsheet_id,
+                        range=f"{sheet_name}!A:ZZ"
+                    ).execute()
+                    values = result.get('values', [])
+                    
+                    if values and len(values) > 1:
+                        # Convert to DataFrame
+                        headers = values[0]
+                        rows = values[1:]
+                        df_existing = pd.DataFrame(rows, columns=headers)
+                        
+                        logger.info(f"📊 Found {len(df_existing)} existing rows in sheet")
+                        
+                        # Merge: identify new, updated, and unchanged rows
+                        if key_col in df_existing.columns and key_col in df_new.columns:
+                            # Merge on key column
+                            existing_keys = set(df_existing[key_col].astype(str))
+                            new_keys = set(df_new[key_col].astype(str))
+                            updated_keys = existing_keys & new_keys
+                            
+                            # For simplicity, mark all existing keys as updated if present in new data
+                            updated_count = len(updated_keys)
+                            new_count = len(new_keys - existing_keys)
+                            skipped_count = len(existing_keys - new_keys)  # Rows removed from Excel (keep in sheet)
+                            
+                            # Final DataFrame: new + all updated existing rows + unchanged existing rows
+                            df_final = pd.concat([
+                                df_new[df_new[key_col].astype(str).isin(new_keys | updated_keys)],  # New + Updated
+                                df_existing[df_existing[key_col].astype(str).isin(existing_keys - new_keys)]  # Unchanged (keep)
+                            ], ignore_index=True)
+                            
+                            logger.info(f"📈 Sync stats: {new_count} new, {updated_count} updated, {skipped_count} unchanged")
+                        else:
+                            # No key column match, just append new data
+                            df_final = pd.concat([df_existing, df_new], ignore_index=True)
+                            new_count = len(df_new)
+                            updated_count = 0
+                            skipped_count = len(df_existing)
+                            logger.info(f"📈 No key column match - appending {new_count} new rows")
+                    else:
+                        # Empty sheet, use new data
+                        df_final = df_new
+                        new_count = len(df_new)
+                        updated_count = 0
+                        skipped_count = 0
+                        logger.info(f"📊 Sheet is empty - uploading all {new_count} rows as new")
+                except Exception as read_err:
+                    logger.warning(f"⚠️ Could not read existing sheet (treating as empty): {read_err}")
+                    df_final = df_new
+                    new_count = len(df_new)
+                    updated_count = 0
+                    skipped_count = 0
+            else:
+                # Sheet doesn't exist or no key column, upload all new data
+                df_final = df_new
+                new_count = len(df_new)
+                updated_count = 0
+                skipped_count = 0
+                logger.info(f"📊 Sheet '{sheet_name}' doesn't exist - uploading all {new_count} rows as new")
+        except Exception as read_err:
+            logger.warning(f"⚠️ Error reading existing sheet (uploading all as new): {read_err}")
+            df_final = df_new
+            new_count = len(df_new)
+            updated_count = 0
+            skipped_count = 0
+        
+        # Step 3: Save snapshot
+        snapshot_path = SNAPSHOTS_DIR / f"{tab_name}.json"
+        try:
+            df_final.to_json(snapshot_path, orient='records', date_format='iso')
+            logger.info(f"💾 Saved snapshot to {snapshot_path}")
+        except Exception as snapshot_err:
+            logger.warning(f"⚠️ Could not save snapshot: {snapshot_err}")
+        
+        # Step 4: Upload to Google Sheets
+        logger.info(f"📤 Uploading {len(df_final)} rows to sheet '{sheet_name}'...")
+        
+        # Ensure sheet exists
+        try:
+            spreadsheet = service.spreadsheets().get(spreadsheetId=spreadsheet_id).execute()
+            sheet_exists = any(s.get('properties', {}).get('title') == sheet_name for s in spreadsheet.get('sheets', []))
+            
+            if not sheet_exists:
+                logger.info(f"📋 Creating new sheet '{sheet_name}'...")
+                request_body = {
+                    'requests': [{
+                        'addSheet': {
+                            'properties': {
+                                'title': sheet_name
+                            }
+                        }
+                    }]
+                }
+                service.spreadsheets().batchUpdate(
+                    spreadsheetId=spreadsheet_id,
+                    body=request_body
+                ).execute()
+                logger.info(f"✅ Created sheet '{sheet_name}'")
+        except Exception as create_err:
+            logger.warning(f"⚠️ Could not create sheet (may already exist): {create_err}")
+        
+        # Convert DataFrame to list of lists for Google Sheets API
+        values = [df_final.columns.tolist()] + df_final.fillna('').astype(str).values.tolist()
+        
+        # Clear existing data and write new data
+        range_name = f"{sheet_name}!A1"
+        service.spreadsheets().values().clear(
+            spreadsheetId=spreadsheet_id,
+            range=f"{sheet_name}!A:ZZ"
+        ).execute()
+        
+        service.spreadsheets().values().update(
+            spreadsheetId=spreadsheet_id,
+            range=range_name,
+            valueInputOption="RAW",
+            body={"values": values}
+        ).execute()
+        
+        logger.info(f"✅ Successfully uploaded {len(df_final)} rows to sheet '{sheet_name}'")
+        
+        return {
+            "tab": tab_name,
+            "new": new_count,
+            "updated": updated_count,
+            "skipped": skipped_count,
+            "rows": len(df_final),
+            "sheet": sheet_name
+        }
+        
+    except Exception as e:
+        logger.error(f"❌ Incremental sync error for {tab_name}: {e}")
+        raise
+
+
+async def sync_all_tabs_to_sheets(download_dir: Path, spreadsheet_id: str):
+    """Upload all exported Excel files to Google Sheets"""
+    tab_results = []
+    
+    for tab in TABS:
+        try:
+            excel_path = download_dir / f"{tab}.xlsx"
+            
+            if not excel_path.exists():
+                logger.warning(f"⚠️ Excel file not found for {tab}: {excel_path}")
+                tab_results.append({"tab": tab, "status": "error", "error": "Excel file not found"})
+                continue
+            
+            result = await incremental_sync(tab, excel_path, spreadsheet_id)
+            tab_results.append(result)
+            logger.info(f"✅ Completed sync for {tab}")
+            
+        except Exception as e:
+            logger.error(f"❌ Error syncing {tab} to Sheets: {e}")
+            tab_results.append({"tab": tab, "status": "error", "error": str(e)})
+    
+    return tab_results
 
 
 async def click_force(page: Page, selector: str, timeout=5000, name="element"):
@@ -727,7 +929,24 @@ async def export_dashboard(session_id: str, spreadsheet_id: str, storage_state: 
 
             await perform_logout(page)
             await browser.close()
-            return {"ok": True, "tabs": results}
+            
+            # STEP 3: Upload all exported Excel files to Google Sheets
+            if spreadsheet_id:
+                logger.info(f"\n{'='*70}")
+                logger.info(f"📤 STEP 3: Uploading exported Excel files to Google Sheets...")
+                logger.info(f"{'='*70}\n")
+                
+                try:
+                    tab_results = await sync_all_tabs_to_sheets(download_dir, spreadsheet_id)
+                    logger.info(f"✅ Google Sheets upload completed: {len(tab_results)} tab(s) processed")
+                    return {"ok": True, "tabs": results, "sheets_sync": tab_results}
+                except Exception as sync_err:
+                    logger.error(f"❌ Google Sheets sync failed: {sync_err}")
+                    logger.error(f"Export completed but Sheets sync failed - files saved in {download_dir}")
+                    return {"ok": True, "tabs": results, "sheets_sync_error": str(sync_err)}
+            else:
+                logger.warning("⚠️ No GOOGLE_SHEET_ID provided - skipping Google Sheets upload")
+                return {"ok": True, "tabs": results, "sheets_sync": "skipped"}
 
     except Exception as e:
         logger.error(f"Export error: {e}")
