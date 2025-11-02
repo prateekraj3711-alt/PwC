@@ -69,13 +69,29 @@ async def incremental_sync(tab_name: str, excel_path: Path, spreadsheet_id: str,
             logger.warning(f"⚠️ Excel file for {tab_name} is empty")
             return {"tab": tab_name, "new": 0, "updated": 0, "skipped": 0, "rows": 0, "error": "Excel file is empty"}
         
+        # Clean control characters from Excel data immediately after reading
+        def clean_excel_value(val):
+            if pd.isna(val):
+                return val
+            val_str = str(val)
+            # Remove invalid JSON control characters (characters below 32 except newline, carriage return, tab)
+            cleaned = ''.join(char if ord(char) >= 32 or char in '\n\r\t' else ' ' for char in val_str)
+            return cleaned
+        
+        # Clean all object (string) columns
+        for col in df_new.select_dtypes(include=['object']).columns:
+            df_new[col] = df_new[col].apply(clean_excel_value)
+        
+        # Clean column names
+        df_new.columns = [clean_excel_value(str(col)) for col in df_new.columns]
+        
         # Add timestamp column
         if "LastSyncedAt" not in df_new.columns:
             df_new["LastSyncedAt"] = datetime.now().isoformat()
         else:
             df_new["LastSyncedAt"] = datetime.now().isoformat()
         
-        logger.info(f"✅ Loaded {len(df_new)} rows from Excel")
+        logger.info(f"✅ Loaded {len(df_new)} rows from Excel (cleaned control characters)")
         
         # Step 2: Read existing data from Google Sheet (if sheet exists)
         service = get_sheets_service()
@@ -98,8 +114,16 @@ async def incremental_sync(tab_name: str, excel_path: Path, spreadsheet_id: str,
                     
                     if values and len(values) > 1:
                         # Convert to DataFrame
-                        headers = values[0]
-                        rows = values[1:]
+                        # Clean control characters from headers and rows
+                        def clean_cell(val):
+                            if val is None:
+                                return ''
+                            val_str = str(val)
+                            # Remove invalid JSON control characters (keep only printable chars and newlines/tabs)
+                            return ''.join(char if ord(char) >= 32 or char in '\n\r\t' else ' ' for char in val_str)
+                        
+                        headers = [clean_cell(h) for h in values[0]]
+                        rows = [[clean_cell(cell) for cell in row] for row in values[1:]]
                         df_existing = pd.DataFrame(rows, columns=headers)
                         
                         logger.info(f"📊 Found {len(df_existing)} existing rows in sheet")
@@ -160,10 +184,19 @@ async def incremental_sync(tab_name: str, excel_path: Path, spreadsheet_id: str,
         # Step 3: Save snapshot
         snapshot_path = SNAPSHOTS_DIR / f"{tab_name}.json"
         try:
-            df_final.to_json(snapshot_path, orient='records', date_format='iso')
+            # Clean DataFrame before saving to JSON (remove/replace control characters)
+            df_clean = df_final.copy()
+            # Replace control characters (newlines, tabs, etc.) in string columns
+            for col in df_clean.select_dtypes(include=['object']).columns:
+                df_clean[col] = df_clean[col].astype(str).replace([r'\n', r'\r', r'\t'], [' ', ' ', ' '], regex=True)
+                # Remove any remaining control characters
+                df_clean[col] = df_clean[col].apply(lambda x: ''.join(char for char in str(x) if ord(char) >= 32 or char in '\n\r\t') if pd.notna(x) else x)
+            
+            df_clean.to_json(snapshot_path, orient='records', date_format='iso', force_ascii=True)
             logger.info(f"💾 Saved snapshot to {snapshot_path}")
         except Exception as snapshot_err:
             logger.warning(f"⚠️ Could not save snapshot: {snapshot_err}")
+            # Don't fail the whole sync if snapshot fails
         
         # Step 4: Upload to Google Sheets
         logger.info(f"📤 Uploading {len(df_final)} rows to sheet '{sheet_name}'...")
@@ -193,7 +226,25 @@ async def incremental_sync(tab_name: str, excel_path: Path, spreadsheet_id: str,
             logger.warning(f"⚠️ Could not create sheet (may already exist): {create_err}")
         
         # Convert DataFrame to list of lists for Google Sheets API
-        values = [df_final.columns.tolist()] + df_final.fillna('').astype(str).values.tolist()
+        # Clean control characters from values to prevent JSON errors
+        def clean_value(val):
+            if pd.isna(val):
+                return ''
+            val_str = str(val)
+            # Replace control characters (keep newlines and tabs for readability in sheets)
+            # But ensure no invalid JSON control characters
+            val_str = ''.join(char if ord(char) >= 32 or char in '\n\r\t' else ' ' for char in val_str)
+            return val_str
+        
+        # Clean column names
+        clean_columns = [clean_value(col) for col in df_final.columns.tolist()]
+        
+        # Clean all values
+        clean_values = []
+        for row in df_final.fillna('').values:
+            clean_values.append([clean_value(val) for val in row])
+        
+        values = [clean_columns] + clean_values
         
         # Clear existing data and write new data
         range_name = f"{sheet_name}!A1"
