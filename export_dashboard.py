@@ -48,20 +48,22 @@ def get_sheets_service():
 
 
 async def click_force(page: Page, selector: str, timeout=5000, name="element"):
+    """Universal click function with proper locator usage"""
     for attempt in range(3):
         try:
             await page.wait_for_selector(selector, timeout=timeout)
-            el = page.locator(selector).first()
-            await el.scroll_into_view_if_needed()
+            # CRITICAL: Use locator.click() not locator()()
+            locator = page.locator(selector).first
+            await locator.scroll_into_view_if_needed()
             await asyncio.sleep(1)
-            await el.click(force=True)
+            await locator.click(force=True)
             logger.info(f"✅ Clicked {name} via {selector}")
             return True
         except Exception as e:
             logger.warning(f"Retrying click for {name} ({attempt+1}/3): {e}")
             await asyncio.sleep(3)
-    screenshot_path = f"/tmp/{name}_fail_{datetime.now().strftime('%H%M%S')}.png"
-    await page.screenshot(path=screenshot_path)
+    screenshot_path = f"/tmp/{name.replace(' ', '_')}_fail_{datetime.now().strftime('%H%M%S')}.png"
+    await page.screenshot(path=screenshot_path, full_page=True)
     raise Exception(f"{name} not clickable after retries (screenshot: {screenshot_path})")
 
 
@@ -77,7 +79,8 @@ async def try_click_selector(page: Page, selectors, timeout_per=4000):
     for sel in selectors:
         try:
             await page.wait_for_selector(sel, timeout=timeout_per)
-            await page.click(sel)
+            # Use locator.click() not page.click()
+            await page.locator(sel).first.click(force=True)
             return True
         except Exception:
             continue
@@ -196,7 +199,30 @@ async def click_advance_search(page: Page):
 
 async def export_tab(page: Page, tab_name: str, download_dir: Path):
     logger.info(f"📊 Exporting tab: {tab_name}")
-    await click_force(page, f'text="{tab_name}"', name=f"tab_{tab_name}")
+    
+    # Try multiple selectors for tab clicking
+    tab_selectors = [
+        f'text="{tab_name}"',
+        f'a:has-text("{tab_name}")',
+        f'button:has-text("{tab_name}")',
+        f'li:has-text("{tab_name}")',
+        f'[data-tab*="{tab_name}"]',
+        f'[aria-label*="{tab_name}"]',
+    ]
+    
+    tab_clicked = False
+    for tab_sel in tab_selectors:
+        try:
+            await click_force(page, tab_sel, timeout=5000, name=f"tab_{tab_name}")
+            tab_clicked = True
+            break
+        except Exception as e:
+            logger.debug(f"Tab selector {tab_sel} failed: {e}")
+            continue
+    
+    if not tab_clicked:
+        raise Exception(f"Could not click tab: {tab_name}")
+    
     await wait_full_load(page, 25, f"tab {tab_name}")
 
     export_selectors = [
@@ -242,18 +268,85 @@ async def export_tab(page: Page, tab_name: str, download_dir: Path):
 
 
 async def perform_logout(page: Page):
+    """Universal logout logic with correct dropdown selectors"""
     try:
         logger.info("🔒 Attempting logout via top-right dropdown...")
-        await wait_full_load(page, 5, "pre-logout")
-        await click_force(page, "button.dropdown-toggle", name="Profile_dropdown")
-        await asyncio.sleep(2)
-        await click_force(page, 'a:has-text("Logout")', name="Logout")
+        await asyncio.sleep(5)  # allow dashboard JS to finish rendering
+        
+        # Correct selectors for Kendo UI menu dropdown
+        selectors_dropdown = [
+            ".k-menu-expand-arrow",
+            "span.k-menu-expand-arrow",
+            "span.k-menu-expand-arrow-icon",
+            "text='Welcome'",
+            "text='Sukrutha CR'"
+        ]
+        
+        clicked = False
+        for attempt in range(3):
+            for sel in selectors_dropdown:
+                try:
+                    await page.wait_for_selector(sel, timeout=8000)
+                    await page.locator(sel).first.click(force=True)
+                    logger.info(f"✅ Profile dropdown opened via selector: {sel}")
+                    clicked = True
+                    break
+                except Exception as e:
+                    logger.warning(f"Retrying click for Profile_dropdown ({attempt+1}/3): {e}")
+                    await asyncio.sleep(3)
+            if clicked:
+                break
+        
+        if not clicked:
+            screenshot = f"/tmp/Profile_dropdown_fail_{datetime.now().strftime('%H%M%S')}.png"
+            await page.screenshot(path=screenshot, full_page=True)
+            logger.error(f"Logout failed: Profile_dropdown not clickable after retries (screenshot: {screenshot})")
+            raise Exception(f"Profile_dropdown not clickable after retries (screenshot: {screenshot})")
+        
+        await asyncio.sleep(10)
+        
+        # Click logout option
+        selectors_logout = [
+            "text='Logout'",
+            "text='Sign out'",
+            "a[href*='Signout']",
+            "a[href*='LogOff']",
+            'a:has-text("Logout")',
+            'a:has-text("Log out")',
+        ]
+        
+        logout_clicked = False
+        for sel in selectors_logout:
+            try:
+                await page.wait_for_selector(sel, timeout=8000)
+                await page.locator(sel).first.click(force=True)
+                logger.info(f"✅ Logout clicked via selector: {sel}")
+                logout_clicked = True
+                break
+            except Exception as e:
+                logger.debug(f"Logout selector {sel} failed: {e}")
+                continue
+        
+        if not logout_clicked:
+            logger.warning("Could not click logout link, trying direct URL fallback...")
+            try:
+                await page.goto("https://compliancenominationportal.in.pwc.com/Account/LogOff", wait_until="networkidle", timeout=30000)
+                await asyncio.sleep(3)
+                logger.info("✅ Logout via direct URL")
+                return
+            except Exception as logoff_err:
+                logger.warning(f"Direct logout URL failed: {logoff_err}")
+        
         await asyncio.sleep(5)
-        await page.wait_for_selector('text="You are logged-out successfully!!!"', timeout=15000)
-        logger.info("✅ Logout confirmed successfully")
+        try:
+            await page.wait_for_selector("text='You are logged-out successfully'", timeout=10000)
+            logger.info("✅ Logout confirmed successfully")
+        except Exception:
+            logger.warning("⚠️ Logout confirmation text not detected, but assuming success")
     except Exception as e:
         logger.error(f"Logout failed: {e}")
-        raise
+        # Don't raise - logout is not critical for the export process
+        logger.warning("Continuing despite logout failure")
 
 
 async def export_dashboard(session_id: str, spreadsheet_id: str, storage_state: Optional[Dict] = None):
