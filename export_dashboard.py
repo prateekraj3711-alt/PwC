@@ -225,21 +225,74 @@ async def export_tab(page: Page, tab_name: str, download_dir: Path):
     
     await wait_full_load(page, 25, f"tab {tab_name}")
 
+    # Enhanced Export to Excel button clicking with universal strategy
+    logger.info(f"🔍 Looking for Export to Excel button for {tab_name}...")
+    
     export_selectors = [
         'button:has-text("Export to excel")',
         'button:has-text("Export to Excel")',
         'a:has-text("Export to excel")',
+        'a:has-text("Export to Excel")',
+        '[aria-label*="Export" i]',
+        '[title*="Export" i]',
+        'button[title*="Export" i]',
+        'a[title*="Export" i]',
+        'button[aria-label*="Export" i]',
+        'a[aria-label*="Export" i]',
     ]
-    export_sel = None
-    for sel in export_selectors:
-        try:
-            await page.wait_for_selector(sel, timeout=5000)
-            export_sel = sel
+    
+    export_clicked = False
+    for attempt in range(3):
+        for sel in export_selectors:
+            try:
+                # Wait up to 30 seconds for button to appear
+                await page.wait_for_selector(sel, timeout=30000)
+                locator = page.locator(sel).first
+                await locator.scroll_into_view_if_needed()
+                await asyncio.sleep(1)
+                await locator.click(force=True)
+                logger.info(f"✅ Export button clicked via selector: {sel}")
+                export_clicked = True
+                break
+            except Exception as e:
+                logger.debug(f"Export selector {sel} failed (attempt {attempt+1}/3): {e}")
+                await asyncio.sleep(2)
+                continue
+        if export_clicked:
             break
-        except Exception:
-            continue
-    if not export_sel:
-        raise Exception(f"Export button not visible for {tab_name}")
+    
+    # If all selectors failed, try JavaScript fallback
+    if not export_clicked:
+        logger.warning("Standard click methods failed, trying JavaScript fallback...")
+        try:
+            js_clicked = await page.evaluate("""
+                () => {
+                    const elements = Array.from(document.querySelectorAll('button, a, [role="button"]'));
+                    for (let el of elements) {
+                        const text = (el.textContent || '').toLowerCase();
+                        const ariaLabel = (el.getAttribute('aria-label') || '').toLowerCase();
+                        const title = (el.getAttribute('title') || '').toLowerCase();
+                        if (text.includes('export') && text.includes('excel') || 
+                            ariaLabel.includes('export') || 
+                            title.includes('export')) {
+                            el.click();
+                            return true;
+                        }
+                    }
+                    return false;
+                }
+            """)
+            if js_clicked:
+                await asyncio.sleep(2)
+                logger.info("✅ Export button clicked via JavaScript")
+                export_clicked = True
+        except Exception as js_err:
+            logger.warning(f"JavaScript click failed: {js_err}")
+    
+    if not export_clicked:
+        screenshot_path = f"/tmp/Export_button_fail_{tab_name.replace(' ', '_')}_{datetime.now().strftime('%H%M%S')}.png"
+        await page.screenshot(path=screenshot_path, full_page=True)
+        raise Exception(f"Export to Excel button not visible/clickable for {tab_name} after all retries (screenshot: {screenshot_path})")
 
     download_event = asyncio.Event()
     file_path = download_dir / f"{tab_name}.xlsx"
@@ -252,7 +305,6 @@ async def export_tab(page: Page, tab_name: str, download_dir: Path):
         logger.info(f"💾 Download saved: {file_path}")
 
     page.on("download", handle_download)
-    await click_force(page, export_sel, name=f"Export_{tab_name}")
     try:
         await asyncio.wait_for(download_event.wait(), timeout=EXPORT_TIMEOUT)
     except asyncio.TimeoutError:
