@@ -225,12 +225,20 @@ async def export_tab(page: Page, tab_name: str, download_dir: Path):
     
     await wait_full_load(page, 25, f"tab {tab_name}")
 
-    # Enhanced Export to Excel button clicking with universal strategy
-    logger.info(f"🔍 Looking for Export to Excel button for {tab_name}...")
+    # Step 3: Click "Export to excel" button
+    # CRITICAL: Export button appears AFTER Advance search is clicked and tab is selected
+    # The button has ID "downloadExcel" and class "btn btn-danger clsdisableAction"
+    # HTML: <input type="button" value="Export to excel" id="downloadExcel" class="btn btn-danger clsdisableAction">
+    logger.info(f"📥 Step 3: Looking for Export to Excel button for {tab_name}...")
     
     export_selectors = [
+        '#downloadExcel',  # Primary selector - exact ID from HTML
+        'input[id="downloadExcel"]',  # Input button with this ID
+        'input[value="Export to excel"][id="downloadExcel"]',  # More specific
         'button:has-text("Export to excel")',
         'button:has-text("Export to Excel")',
+        'input[value="Export to excel"]',
+        'input[value="Export to Excel"]',
         'a:has-text("Export to excel")',
         'a:has-text("Export to Excel")',
         '[aria-label*="Export" i]',
@@ -267,12 +275,20 @@ async def export_tab(page: Page, tab_name: str, download_dir: Path):
         try:
             js_clicked = await page.evaluate("""
                 () => {
-                    const elements = Array.from(document.querySelectorAll('button, a, [role="button"]'));
+                    // First, try the specific ID from HTML: id="downloadExcel"
+                    const downloadExcelBtn = document.getElementById('downloadExcel');
+                    if (downloadExcelBtn) {
+                        downloadExcelBtn.click();
+                        return true;
+                    }
+                    
+                    // Fallback: search by text/attributes
+                    const elements = Array.from(document.querySelectorAll('button, input[type="button"], a, [role="button"]'));
                     for (let el of elements) {
-                        const text = (el.textContent || '').toLowerCase();
+                        const text = (el.textContent || el.value || '').toLowerCase();
                         const ariaLabel = (el.getAttribute('aria-label') || '').toLowerCase();
                         const title = (el.getAttribute('title') || '').toLowerCase();
-                        if (text.includes('export') && text.includes('excel') || 
+                        if ((text.includes('export') && text.includes('excel')) || 
                             ariaLabel.includes('export') || 
                             title.includes('export')) {
                             el.click();
@@ -315,8 +331,10 @@ async def export_tab(page: Page, tab_name: str, download_dir: Path):
         raise Exception(f"File missing or empty for {tab_name}")
 
     await asyncio.sleep(1)
-    logger.info(f"✅ Export completed for {tab_name} ({file_path.stat().st_size} bytes)")
-    return {"tab": tab_name, "status": "done"}
+    file_size = file_path.stat().st_size
+    logger.info(f"✅ Step 4: Export completed for {tab_name} ({file_size} bytes)")
+    logger.info(f"✅ ✅ Tab '{tab_name}' export workflow finished successfully")
+    return {"tab": tab_name, "status": "done", "file_size": file_size}
 
 
 async def perform_logout(page: Page):
@@ -663,20 +681,49 @@ async def export_dashboard(session_id: str, spreadsheet_id: str, storage_state: 
                 # This might be OK if it's a redirect, but log it
             
             logger.info("✅ Successfully navigated to dashboard - URL validated")
+            
+            # CRITICAL STEP 1: Click "Advance search" FIRST
+            # This makes the "Export to excel" button visible
+            # The Export button (id="downloadExcel") only appears after Advance search is clicked
+            logger.info("🔍 STEP 1: Clicking 'Advance search' to reveal Export button...")
             await click_advance_search(page)
-
+            logger.info("✅ 'Advance search' clicked - Export button (#downloadExcel) should now be visible")
+            
+            # Verify Export button is visible after Advance search
+            try:
+                await asyncio.sleep(3)  # Brief wait for UI to update
+                export_visible = await page.locator('#downloadExcel').is_visible(timeout=5000)
+                if export_visible:
+                    logger.info("✅ Verified: Export button (#downloadExcel) is visible after Advance search")
+                else:
+                    logger.warning("⚠️ Export button (#downloadExcel) not immediately visible, but continuing...")
+            except Exception as e:
+                logger.warning(f"⚠️ Could not verify Export button visibility (non-critical): {e}")
+            
             download_dir = TMP_DIR / "dashboard_exports"
             download_dir.mkdir(parents=True, exist_ok=True)
 
+            # STEP 2: Process each tab sequentially
+            # For each tab: Select tab → Wait for load → Click Export → Wait for download → Next tab
+            logger.info(f"\n{'='*70}")
+            logger.info(f"📋 STEP 2: Processing {len(TABS)} tabs sequentially...")
+            logger.info(f"{'='*70}\n")
             results = []
-            for tab in TABS:
+            for idx, tab in enumerate(TABS, 1):
                 try:
+                    logger.info(f"\n{'='*70}")
+                    logger.info(f"🔄 Processing tab {idx}/{len(TABS)}: {tab}")
+                    logger.info(f"{'='*70}")
                     result = await export_tab(page, tab, download_dir)
                     results.append(result)
-                    await asyncio.sleep(25)
+                    # Wait between tabs to ensure system is ready for next export
+                    if idx < len(TABS):
+                        logger.info(f"⏸️ Waiting 25s before processing next tab...")
+                        await asyncio.sleep(25)
                 except Exception as e:
-                    logger.error(f"❌ Error on {tab}: {e}")
+                    logger.error(f"❌ Error exporting tab '{tab}': {e}")
                     await page.screenshot(path=f"/tmp/{tab}_fail_{datetime.now().strftime('%H%M%S')}.png")
+                    results.append({"tab": tab, "status": "error", "error": str(e)})
 
             await perform_logout(page)
             await browser.close()
