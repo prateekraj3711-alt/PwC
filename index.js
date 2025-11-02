@@ -329,7 +329,8 @@ async function destroyAllBrowserContexts() {
     
     // Step 5: CRITICAL - Wait for PwC server to recognize all sessions are closed
     // This ensures no concurrent session conflicts when creating new login
-    await new Promise(resolve => setTimeout(resolve, 10000));
+    // Increased wait time to ensure PwC processes all logout requests
+    await new Promise(resolve => setTimeout(resolve, 15000)); // 15 seconds instead of 10
     
     console.log('[Session Isolation] ✅ Complete cleanup finished. All previous sessions destroyed.');
     console.log(`[Session Isolation] Summary: ${sessionCount} session(s) destroyed, ${jsonFiles.length} file(s) deleted, waited 10s for PwC server recognition`);
@@ -990,21 +991,28 @@ app.post('/complete-login', async (req, res) => {
     const screenshot = await page.screenshot({ type: 'png' });
     const screenshot_base64 = screenshot.toString('base64');
 
+    // CRITICAL: Save storage_state FIRST (while session is still valid)
+    // Then close browser WITHOUT logging out (logout invalidates cookies)
+    // The storage_state contains valid cookies that Python can reuse
     const sessionPath = await getSessionPath(effectiveSessionId);
     const storageState = await context.storageState();
     try {
       await fs.writeFile(sessionPath, JSON.stringify(storageState), 'utf-8');
-      console.log(`[Session] Saved complete login session to: ${sessionPath}`);
+      console.log(`[Session] ✅ Saved complete login session to: ${sessionPath} (${storageState?.cookies?.length || 0} cookies)`);
     } catch (saveErr) {
-      console.error(`[Session] Failed to save session: ${saveErr.message}`);
+      console.error(`[Session] ❌ Failed to save session: ${saveErr.message}`);
     }
     
-    // CRITICAL: Close the browser context immediately after saving storage_state
-    // This prevents AccessDeniedConcurrent when Python tries to use the same session
-    // The storage_state file is all we need for Python to recreate the session
-    console.log(`[Session Isolation] Closing Node.js browser context to avoid concurrent session conflicts...`);
+    // CRITICAL: Close browser WITHOUT logging out
+    // Why: Logging out invalidates cookies in storage_state
+    // Instead: Close browser (ends Node.js session), keep storage_state with valid cookies
+    // Python will use storage_state to create NEW browser context (new session, same auth)
+    // The 90-second wait ensures PwC recognizes Node.js browser closure before Python starts
+    console.log(`[Session Isolation] Closing Node.js browser context (NOT logging out - preserving cookies for Python)...`);
     await browser.close().catch(() => {});
     sessions.delete(effectiveSessionId);
+    console.log(`[Session Isolation] ✅ Browser closed, session removed from memory`);
+    console.log(`[Session Isolation] Storage_state preserved with valid cookies - Python can recreate session`);
     
     // Clean up old session files (older than 5 minutes) after successful login
     await cleanupOldSessions();
@@ -1015,11 +1023,14 @@ app.post('/complete-login', async (req, res) => {
 
     const exportServiceUrl = process.env.EXPORT_SERVICE_URL || 'http://localhost:8000';
     
-    // CRITICAL: Wait 60 seconds to ensure:
+    // CRITICAL: Wait 180 seconds (3 minutes) to ensure:
     // 1. Session file is fully written
-    // 2. Node.js browser context is closed (no concurrent session)
-    // 3. PwC server has time to recognize Node.js session is closed
-    // 4. Python can safely create new context using storage_state without AccessDeniedConcurrent
+    // 2. Node.js browser context is closed (terminates session on PwC server)
+    // 3. PwC server has sufficient time to fully recognize browser closure and session termination
+    // 4. Python can safely create new context using storage_state cookies without AccessDeniedConcurrent
+    // Note: We DON'T logout (which would invalidate cookies) - we just close browser
+    // The extended wait ensures PwC's session tracking system recognizes the closure
+    console.log(`[Auto-Export] Waiting 180 seconds (3 minutes) before triggering export (to ensure PwC fully recognizes browser closure)...`);
     setTimeout(async () => {
       try {
         // Read the session storage state to send it directly
@@ -1105,7 +1116,7 @@ app.post('/complete-login', async (req, res) => {
         console.error(`[Auto-Export] ❌ Unexpected error: ${exportErr.message}`);
         console.error(`[Auto-Export] Stack: ${exportErr.stack}`);
       }
-    }, 60000); // Wait 60 seconds to ensure PwC server recognizes Node.js session is closed
+    }, 180000); // Wait 180 seconds (3 minutes) to ensure PwC fully recognizes Node.js browser closure
 
     return res.status(200).json({
       ok: true,
