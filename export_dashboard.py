@@ -327,7 +327,7 @@ async def export_dashboard(session_id: str, spreadsheet_id: str, storage_state: 
             
             # Navigate to dashboard with error detection
             logger.info("Navigating to dashboard with authenticated session...")
-            await page.goto("https://compliancenominationportal.in.pwc.com/dashboard", wait_until="networkidle", timeout=60000)
+            await page.goto("https://compliancenominationportal.in.pwc.com/BGVAdmin/BGVDashboard", wait_until="networkidle", timeout=60000)
             await asyncio.sleep(3)
             
             # Check for error page
@@ -348,6 +348,7 @@ async def export_dashboard(session_id: str, spreadsheet_id: str, storage_state: 
                     
                     # Try clicking dashboard link if it exists
                     dashboard_clicked = await try_click_selector(page, [
+                        'a[href*="BGVDashboard"]',
                         'a[href*="dashboard"]',
                         'a:has-text("Dashboard")',
                         'text="Dashboard"',
@@ -364,7 +365,7 @@ async def export_dashboard(session_id: str, spreadsheet_id: str, storage_state: 
                     # If still on error page, try direct URL again
                     if "ErrorPage" in page.url or "Oops" in page.url:
                         logger.warning("Still on error page, trying direct dashboard URL again...")
-                        await page.goto("https://compliancenominationportal.in.pwc.com/dashboard", wait_until="networkidle", timeout=30000)
+                        await page.goto("https://compliancenominationportal.in.pwc.com/BGVAdmin/BGVDashboard", wait_until="networkidle", timeout=30000)
                         await asyncio.sleep(3)
                         
                 except Exception as nav_err:
@@ -388,7 +389,8 @@ async def export_dashboard(session_id: str, spreadsheet_id: str, storage_state: 
                         f"1. Session expired or invalid\n"
                         f"2. User doesn't have dashboard access\n"
                         f"3. Dashboard URL requires authentication that session lacks\n\n"
-                        f"URL: {final_url}\n"
+                        f"Expected: https://compliancenominationportal.in.pwc.com/BGVAdmin/BGVDashboard\n"
+                        f"Actual URL: {final_url}\n"
                         f"Screenshot: {error_screenshot}\n"
                         f"Please verify the session is valid and try logging in again."
                     )
@@ -425,11 +427,11 @@ async def export_dashboard(session_id: str, spreadsheet_id: str, storage_state: 
                     raise check_err
             
             # Verify we're actually on dashboard (not just not on error page)
-            if "/dashboard" not in final_url and "compliancenominationportal" in final_url:
+            if "BGVDashboard" not in final_url and "/dashboard" not in final_url.lower() and "compliancenominationportal" in final_url:
                 logger.warning(f"Not on dashboard URL, but also not on error page: {final_url}")
                 # Try to navigate to dashboard one more time
                 try:
-                    await page.goto("https://compliancenominationportal.in.pwc.com/dashboard", wait_until="networkidle", timeout=30000)
+                    await page.goto("https://compliancenominationportal.in.pwc.com/BGVAdmin/BGVDashboard", wait_until="networkidle", timeout=30000)
                     await asyncio.sleep(3)
                     final_url = page.url
                     if "ErrorPage" in final_url or "Oops" in final_url:
@@ -462,8 +464,8 @@ async def export_dashboard(session_id: str, spreadsheet_id: str, storage_state: 
                 )
             
             # Verify URL actually contains dashboard
-            if "/dashboard" not in final_check_url.lower():
-                logger.warning(f"⚠️ URL doesn't contain '/dashboard': {final_check_url}")
+            if "BGVDashboard" not in final_check_url and "/dashboard" not in final_check_url.lower():
+                logger.warning(f"⚠️ URL doesn't contain 'BGVDashboard' or '/dashboard': {final_check_url}")
                 # This might be OK if it's a redirect, but log it
             
             logger.info("✅ Successfully navigated to dashboard - URL validated")
