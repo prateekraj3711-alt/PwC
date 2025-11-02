@@ -43,10 +43,91 @@ TABS = [
 def get_sheets_service():
     if not GOOGLE_CREDENTIALS_JSON:
         raise ValueError("GOOGLE_CREDENTIALS_JSON environment variable is required")
-    creds_json = GOOGLE_CREDENTIALS_JSON
-    creds_info = json.loads(creds_json.replace("\\n", "\n")) if "\\n" in creds_json else json.loads(creds_json)
-    creds = service_account.Credentials.from_service_account_info(creds_info, scopes=["https://www.googleapis.com/auth/spreadsheets"])
-    return build("sheets", "v4", credentials=creds)
+    
+    try:
+        creds_json = GOOGLE_CREDENTIALS_JSON
+        
+        # Clean control characters from JSON string (except newlines/tabs in string values)
+        # This handles cases where the environment variable has invalid control characters
+        def clean_json_string(s):
+            # Remove control characters except newline, carriage return, tab
+            # But preserve them if they're inside JSON string values
+            result = []
+            in_string = False
+            escape_next = False
+            for i, char in enumerate(s):
+                if escape_next:
+                    result.append(char)
+                    escape_next = False
+                    continue
+                if char == '\\':
+                    escape_next = True
+                    result.append(char)
+                    continue
+                if char == '"' and (i == 0 or s[i-1] != '\\'):
+                    in_string = not in_string
+                    result.append(char)
+                    continue
+                # Keep all characters in JSON structure (outside strings) and printable chars
+                # Also keep newline/cr/tab inside strings (for private_key)
+                if ord(char) >= 32 or char in '\n\r\t' or (in_string and char in '\n\r\t'):
+                    result.append(char)
+                elif ord(char) < 32:
+                    # Replace control character with space (safe for JSON parsing)
+                    result.append(' ')
+            return ''.join(result)
+        
+        # Clean the JSON string
+        creds_json_cleaned = clean_json_string(creds_json)
+        
+        # Handle multiple levels of escaping
+        creds_info = None
+        parse_errors = []
+        
+        # Try 1: Direct JSON parse (cleaned)
+        try:
+            creds_info = json.loads(creds_json_cleaned)
+        except json.JSONDecodeError as e1:
+            parse_errors.append(f"Direct parse: {e1}")
+            # Try 2: Replace escaped newlines
+            try:
+                creds_json_fixed = creds_json_cleaned.replace("\\n", "\n").replace("\\r", "\r")
+                creds_info = json.loads(creds_json_fixed)
+            except json.JSONDecodeError as e2:
+                parse_errors.append(f"Newline replace: {e2}")
+                # Try 3: Use codecs unicode_escape
+                try:
+                    import codecs
+                    # Only decode if there are actual escape sequences
+                    if '\\n' in creds_json_cleaned or '\\r' in creds_json_cleaned:
+                        creds_json_fixed = codecs.decode(creds_json_cleaned, 'unicode_escape')
+                        creds_info = json.loads(creds_json_fixed)
+                    else:
+                        raise json.JSONDecodeError("No escape sequences found", creds_json_cleaned, 0)
+                except (json.JSONDecodeError, UnicodeDecodeError) as e3:
+                    parse_errors.append(f"Unicode escape: {e3}")
+                    raise ValueError(f"Failed to parse GOOGLE_CREDENTIALS_JSON. Errors: {parse_errors}")
+        
+        # Validate the structure
+        if not isinstance(creds_info, dict):
+            raise ValueError("GOOGLE_CREDENTIALS_JSON must be a valid JSON object")
+        
+        # Ensure private_key has actual newlines (not escaped strings)
+        if 'private_key' in creds_info and isinstance(creds_info['private_key'], str):
+            # Replace literal \n with actual newlines if needed
+            if '\\n' in creds_info['private_key']:
+                creds_info['private_key'] = creds_info['private_key'].replace('\\n', '\n')
+        
+        creds = service_account.Credentials.from_service_account_info(
+            creds_info, 
+            scopes=["https://www.googleapis.com/auth/spreadsheets"]
+        )
+        return build("sheets", "v4", credentials=creds)
+    except Exception as e:
+        logger.error(f"Failed to parse GOOGLE_CREDENTIALS_JSON: {e}")
+        logger.error(f"JSON length: {len(GOOGLE_CREDENTIALS_JSON) if GOOGLE_CREDENTIALS_JSON else 0}")
+        logger.error(f"First 200 chars: {GOOGLE_CREDENTIALS_JSON[:200] if GOOGLE_CREDENTIALS_JSON else 'N/A'}")
+        raise ValueError(f"Invalid GOOGLE_CREDENTIALS_JSON: {e}")
 
 
 async def incremental_sync(tab_name: str, excel_path: Path, spreadsheet_id: str, key_col: str = "Candidate ID"):
@@ -94,7 +175,15 @@ async def incremental_sync(tab_name: str, excel_path: Path, spreadsheet_id: str,
         logger.info(f"✅ Loaded {len(df_new)} rows from Excel (cleaned control characters)")
         
         # Step 2: Read existing data from Google Sheet (if sheet exists)
-        service = get_sheets_service()
+        try:
+            service = get_sheets_service()
+        except Exception as creds_err:
+            logger.error(f"❌ Failed to initialize Google Sheets service: {creds_err}")
+            logger.error(f"❌ Error type: {type(creds_err).__name__}")
+            import traceback
+            logger.error(f"❌ Traceback: {traceback.format_exc()}")
+            raise Exception(f"Google Sheets credentials error: {creds_err}")
+        
         sheet_name = tab_name  # Use tab name as sheet name
         
         try:
@@ -1101,6 +1190,96 @@ async def get_screenshot(filename: str):
     if file_path.exists():
         return FileResponse(file_path, media_type="image/png")
     raise HTTPException(status_code=404, detail=f"Screenshot not found: {filename}")
+
+
+class UploadRequest(BaseModel):
+    spreadsheet_id: Optional[str] = None
+
+
+@app.post("/upload-to-sheets")
+async def upload_to_sheets_only(req: Optional[UploadRequest] = None):
+    """
+    Upload existing Excel files to Google Sheets (STEP 3 only - no browser automation)
+    Reads Excel files from /tmp/dashboard_exports/ and uploads them to Google Sheets
+    """
+    try:
+        spreadsheet_id = None
+        if req:
+            spreadsheet_id = req.spreadsheet_id
+        spreadsheet_id = spreadsheet_id or GOOGLE_SHEET_ID
+        
+        if not spreadsheet_id:
+            raise HTTPException(
+                status_code=400, 
+                detail="spreadsheet_id required (set GOOGLE_SHEET_ID env or provide in request body)"
+            )
+        
+        if not GOOGLE_CREDENTIALS_JSON:
+            raise HTTPException(
+                status_code=400,
+                detail="GOOGLE_CREDENTIALS_JSON environment variable is required"
+            )
+        
+        logger.info(f"\n{'='*70}")
+        logger.info(f"📤 Uploading existing Excel files to Google Sheets (STEP 3 only)")
+        logger.info(f"📋 Using spreadsheet_id: {spreadsheet_id}")
+        logger.info(f"{'='*70}\n")
+        
+        download_dir = TMP_DIR / "dashboard_exports"
+        
+        if not download_dir.exists():
+            raise HTTPException(
+                status_code=404,
+                detail=f"Export directory not found: {download_dir}. Run full export first to generate Excel files."
+            )
+        
+        # Check which Excel files exist
+        existing_files = []
+        for tab in TABS:
+            excel_path = download_dir / f"{tab}.xlsx"
+            if excel_path.exists():
+                file_size = excel_path.stat().st_size
+                existing_files.append({"tab": tab, "file": str(excel_path), "size_bytes": file_size})
+        
+        if not existing_files:
+            raise HTTPException(
+                status_code=404,
+                detail=f"No Excel files found in {download_dir}. Files must exist before upload."
+            )
+        
+        logger.info(f"📁 Found {len(existing_files)} Excel file(s) to upload:")
+        for file_info in existing_files:
+            logger.info(f"   - {file_info['tab']}: {file_info['size_bytes']} bytes")
+        
+        # Upload all tabs to Sheets
+        tab_results = await sync_all_tabs_to_sheets(download_dir, spreadsheet_id)
+        
+        success_count = sum(1 for r in tab_results if r.get("status") != "error" and "error" not in r)
+        error_count = len(tab_results) - success_count
+        
+        logger.info(f"\n{'='*70}")
+        logger.info(f"✅ Upload completed: {success_count} successful, {error_count} errors")
+        logger.info(f"{'='*70}\n")
+        
+        return JSONResponse(content={
+            "ok": True,
+            "message": f"Uploaded {success_count} tab(s) to Google Sheets",
+            "spreadsheet_id": spreadsheet_id,
+            "tab_results": tab_results,
+            "summary": {
+                "total": len(tab_results),
+                "successful": success_count,
+                "errors": error_count
+            }
+        })
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Upload to Sheets error: {e}")
+        import traceback
+        logger.error(f"Traceback: {traceback.format_exc()}")
+        raise HTTPException(status_code=500, detail=f"Upload failed: {e}")
 
 
 @app.get("/test-sheets")
