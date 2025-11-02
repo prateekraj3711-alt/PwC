@@ -450,34 +450,16 @@ async def export_dashboard(session_id: str, spreadsheet_id: str, storage_state: 
             # Wait a moment for context to initialize
             await asyncio.sleep(3)
             
-            # CRITICAL: Navigate to root URL first - PwC will redirect authenticated users to dashboard
-            # This establishes session context and lets PwC handle routing
-            logger.info("🔍 Navigating to root URL - PwC will redirect to dashboard if authenticated...")
-            await page.goto("https://compliancenominationportal.in.pwc.com/", wait_until="networkidle", timeout=60000)
-            await asyncio.sleep(5)  # Wait for redirect/dashboard to load
+            # CRITICAL: Navigate directly to dashboard using the valid cookies from storage_state
+            # We skip root URL to avoid any redirect delays or session validation issues
+            # The cookies in storage_state are valid - we just need to use them in this NEW browser context
+            logger.info("🔍 Navigating directly to dashboard using storage_state cookies...")
+            await page.goto("https://compliancenominationportal.in.pwc.com/BGVAdmin/BGVDashboard", wait_until="networkidle", timeout=60000)
+            await asyncio.sleep(5)  # Wait for dashboard to fully load
             
-            # Check if we got redirected or if we're still on root
+            # Check current URL after navigation
             current_url = page.url
-            logger.info(f"📍 Current URL after root navigation: {current_url}")
-            
-            # Check for AccessDeniedConcurrent immediately
-            if "AccessDeniedConcurrent" in current_url or "/Login/AccessDeniedConcurrent" in current_url:
-                error_screenshot = f"/tmp/session_expired_root_{datetime.now().strftime('%H%M%S')}.png"
-                await page.screenshot(path=error_screenshot, full_page=True)
-                await browser.close()
-                logger.error(f"❌ Session expired at root URL - AccessDeniedConcurrent: {current_url}")
-                raise HTTPException(
-                    status_code=401,
-                    detail=f"Session expired — please start new login session via Node.js. AccessDeniedConcurrent detected at root. URL: {current_url}. Screenshot: {error_screenshot}"
-                )
-            
-            # If we're still on root and not redirected, try navigating directly to dashboard
-            if current_url == "https://compliancenominationportal.in.pwc.com/" or current_url == "https://compliancenominationportal.in.pwc.com":
-                logger.info("Still on root URL, navigating directly to dashboard...")
-                await page.goto("https://compliancenominationportal.in.pwc.com/BGVAdmin/BGVDashboard", wait_until="networkidle", timeout=60000)
-                await asyncio.sleep(5)
-                current_url = page.url
-                logger.info(f"📍 Current URL after dashboard navigation: {current_url}")
+            logger.info(f"📍 Current URL after dashboard navigation: {current_url}")
             
             # Check for error page or concurrent access denial (current_url is already set above)
             logger.info(f"📍 Final current URL: {current_url}")
