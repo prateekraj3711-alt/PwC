@@ -470,14 +470,25 @@ async def export_dashboard(session_id: str, spreadsheet_id: str, storage_state: 
             # Wait a moment for context to initialize
             await asyncio.sleep(2)
             
-            # Navigate to dashboard with error detection
-            logger.info("Navigating to dashboard with authenticated session...")
+            # CRITICAL: Validate session before proceeding - check for AccessDeniedConcurrent
+            logger.info("🔍 Validating session before navigation...")
             await page.goto("https://compliancenominationportal.in.pwc.com/BGVAdmin/BGVDashboard", wait_until="networkidle", timeout=60000)
             await asyncio.sleep(3)
             
-            # Check for error page
+            # Check for error page or concurrent access denial
             current_url = page.url
             logger.info(f"📍 Current URL after navigation: {current_url}")
+            
+            # CRITICAL: Check for AccessDeniedConcurrent - session expired/invalid
+            if "AccessDeniedConcurrent" in current_url or "/Login/AccessDeniedConcurrent" in current_url:
+                error_screenshot = f"/tmp/session_expired_{datetime.now().strftime('%H%M%S')}.png"
+                await page.screenshot(path=error_screenshot, full_page=True)
+                await browser.close()
+                logger.error(f"❌ Session expired - AccessDeniedConcurrent detected: {current_url}")
+                raise HTTPException(
+                    status_code=401,
+                    detail=f"Session expired — please start new login session via Node.js. URL: {current_url}. Screenshot: {error_screenshot}"
+                )
             
             if "ErrorPage" in current_url or "Oops" in current_url:
                 logger.warning("Detected error page, trying alternative navigation...")
@@ -574,22 +585,60 @@ async def export_dashboard(session_id: str, spreadsheet_id: str, storage_state: 
             # Verify we're actually on dashboard (not just not on error page)
             if "BGVDashboard" not in final_url and "/dashboard" not in final_url.lower() and "compliancenominationportal" in final_url:
                 logger.warning(f"Not on dashboard URL, but also not on error page: {final_url}")
+                
+                # CRITICAL: Check again for AccessDeniedConcurrent after retry
+                if "AccessDeniedConcurrent" in final_url or "/Login/AccessDeniedConcurrent" in final_url:
+                    error_screenshot = f"/tmp/session_expired_retry_{datetime.now().strftime('%H%M%S')}.png"
+                    await page.screenshot(path=error_screenshot, full_page=True)
+                    await browser.close()
+                    logger.error(f"❌ Session expired on retry - AccessDeniedConcurrent: {final_url}")
+                    raise HTTPException(
+                        status_code=401,
+                        detail=f"Session expired — please start new login session via Node.js. URL: {final_url}. Screenshot: {error_screenshot}"
+                    )
+                
                 # Try to navigate to dashboard one more time
                 try:
                     await page.goto("https://compliancenominationportal.in.pwc.com/BGVAdmin/BGVDashboard", wait_until="networkidle", timeout=30000)
                     await asyncio.sleep(3)
                     final_url = page.url
+                    
+                    # Final check for AccessDeniedConcurrent
+                    if "AccessDeniedConcurrent" in final_url or "/Login/AccessDeniedConcurrent" in final_url:
+                        error_screenshot = f"/tmp/session_expired_final_{datetime.now().strftime('%H%M%S')}.png"
+                        await page.screenshot(path=error_screenshot, full_page=True)
+                        await browser.close()
+                        logger.error(f"❌ Session expired on final retry - AccessDeniedConcurrent: {final_url}")
+                        raise HTTPException(
+                            status_code=401,
+                            detail=f"Session expired — please start new login session via Node.js. URL: {final_url}. Screenshot: {error_screenshot}"
+                        )
+                    
                     if "ErrorPage" in final_url or "Oops" in final_url:
                         error_screenshot = f"/tmp/dashboard_nav_failed_{datetime.now().strftime('%H%M%S')}.png"
                         await page.screenshot(path=error_screenshot, full_page=True)
                         raise Exception(f"Final navigation to dashboard failed. URL: {final_url}. Screenshot: {error_screenshot}")
+                except HTTPException:
+                    raise  # Re-raise HTTPException for session expired
                 except Exception as nav_err:
                     if "ErrorPage" in str(nav_err) or "Oops" in str(nav_err):
                         raise
                     logger.warning(f"Dashboard navigation warning: {nav_err}")
             
-            # CRITICAL: Final validation before proceeding - must not be on error page
+            # CRITICAL: Final validation before proceeding - must not be on error page or AccessDeniedConcurrent
             final_check_url = page.url
+            
+            # Final check for AccessDeniedConcurrent
+            if "AccessDeniedConcurrent" in final_check_url or "/Login/AccessDeniedConcurrent" in final_check_url:
+                error_screenshot = f"/tmp/pre_advance_search_expired_{datetime.now().strftime('%H%M%S')}.png"
+                await page.screenshot(path=error_screenshot, full_page=True)
+                await browser.close()
+                logger.error(f"❌ CRITICAL: Session expired before Advance Search - AccessDeniedConcurrent: {final_check_url}")
+                raise HTTPException(
+                    status_code=401,
+                    detail=f"Session expired — please start new login session via Node.js. Current URL: {final_check_url}. Screenshot: {error_screenshot}"
+                )
+            
             if "ErrorPage" in final_check_url or "Oops" in final_check_url:
                 error_screenshot = f"/tmp/pre_advance_search_error_{datetime.now().strftime('%H%M%S')}.png"
                 await page.screenshot(path=error_screenshot, full_page=True)
