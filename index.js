@@ -925,19 +925,27 @@ app.post('/complete-login', async (req, res) => {
       console.error(`[Session] Failed to save session: ${saveErr.message}`);
     }
     
+    // CRITICAL: Close the browser context immediately after saving storage_state
+    // This prevents AccessDeniedConcurrent when Python tries to use the same session
+    // The storage_state file is all we need for Python to recreate the session
+    console.log(`[Session Isolation] Closing Node.js browser context to avoid concurrent session conflicts...`);
+    await browser.close().catch(() => {});
+    sessions.delete(effectiveSessionId);
+    
     // Clean up old session files (older than 5 minutes) after successful login
     await cleanupOldSessions();
 
-    session.expiry = Date.now() + SESSION_TTL;
-    sessions.set(effectiveSessionId, session);
+    // Store session metadata (without browser) for tracking
+    // Python will use the storage_state file to recreate the session
+    console.log(`[Session] Session ${effectiveSessionId} saved and browser closed. Python can now use it without conflicts.`);
 
     const exportServiceUrl = process.env.EXPORT_SERVICE_URL || 'http://localhost:8000';
     
-    // CRITICAL: Wait even longer (30 seconds) to ensure:
+    // CRITICAL: Wait 60 seconds to ensure:
     // 1. Session file is fully written
-    // 2. All previous browser contexts are fully closed
-    // 3. PwC server has time to recognize old sessions are gone (critical for AccessDeniedConcurrent)
-    // 4. Node.js has already destroyed all old contexts (10s wait in destroyAllBrowserContexts)
+    // 2. Node.js browser context is closed (no concurrent session)
+    // 3. PwC server has time to recognize Node.js session is closed
+    // 4. Python can safely create new context using storage_state without AccessDeniedConcurrent
     setTimeout(async () => {
       try {
         // Read the session storage state to send it directly
@@ -989,7 +997,7 @@ app.post('/complete-login', async (req, res) => {
       } catch (exportErr) {
         console.error(`[Auto-Export] ❌ Error: ${exportErr.message}`);
       }
-    }, 30000); // Wait 30 seconds total (10s in destroyAllBrowserContexts + 20s here = 30s)
+    }, 60000); // Wait 60 seconds to ensure PwC server recognizes Node.js session is closed
 
     return res.status(200).json({
       ok: true,
@@ -1001,7 +1009,9 @@ app.post('/complete-login', async (req, res) => {
 
   } catch (err) {
     let screenshot_base64 = undefined;
-    if (browser) {
+    // Only close browser if we haven't already closed it after successful login
+    if (browser && !sessions.has(effectiveSessionId)) {
+      // Browser already closed after login, don't close again
       try {
         const contexts = browser.contexts();
         if (contexts.length > 0) {
@@ -1013,6 +1023,22 @@ app.post('/complete-login', async (req, res) => {
         }
       } catch (_) {}
       await browser.close().catch(() => {});
+    } else if (browser) {
+      // Browser still open (error occurred before closing)
+      try {
+        const contexts = browser.contexts();
+        if (contexts.length > 0) {
+          const pages = await contexts[0].pages();
+          if (pages.length > 0) {
+            const scr = await pages[0].screenshot({ fullPage: true, type: 'png' }).catch(() => null);
+            screenshot_base64 = scr ? scr.toString('base64') : undefined;
+          }
+        }
+      } catch (_) {}
+      await browser.close().catch(() => {});
+      if (effectiveSessionId) {
+        sessions.delete(effectiveSessionId);
+      }
     }
     return res.status(500).json({
       ok: false,
