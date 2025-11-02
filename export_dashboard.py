@@ -292,11 +292,41 @@ async def export_dashboard(session_id: str, spreadsheet_id: str, storage_state: 
 
         async with async_playwright() as p:
             browser = await p.chromium.launch(headless=True, args=["--no-sandbox"])
+            
+            # CRITICAL: Start fresh - don't use storage_state initially to clear any concurrent sessions
+            logger.info("🔄 Starting fresh session to clear concurrent logins...")
+            context = await browser.new_context(accept_downloads=True)
+            page = await context.new_page()
+            
+            # Navigate to logout/login page to clear any existing sessions
+            try:
+                logger.info("Clearing any existing concurrent sessions...")
+                await page.goto("https://compliancenominationportal.in.pwc.com/Account/LogOff", wait_until="networkidle", timeout=30000)
+                await asyncio.sleep(2)
+                
+                # Check if we're on logout confirmation or login page
+                current_url = page.url
+                if "LogOff" in current_url or "Login" in current_url or "logout" in current_url.lower():
+                    logger.info("✅ Successfully cleared concurrent session")
+                    await asyncio.sleep(2)
+                else:
+                    logger.warning(f"Unexpected page after logout attempt: {current_url}")
+            except Exception as clear_err:
+                logger.warning(f"Could not clear concurrent session (may not be necessary): {clear_err}")
+            
+            # Close the temporary context and create a new one with storage_state
+            await context.close()
+            logger.info("✅ Creating authenticated context with storage_state...")
+            
+            # Now create context with the storage_state from login
             context = await browser.new_context(storage_state=storage_state, accept_downloads=True)
             page = await context.new_page()
             
+            # Wait a moment for context to initialize
+            await asyncio.sleep(2)
+            
             # Navigate to dashboard with error detection
-            logger.info("Navigating to dashboard...")
+            logger.info("Navigating to dashboard with authenticated session...")
             await page.goto("https://compliancenominationportal.in.pwc.com/dashboard", wait_until="networkidle", timeout=60000)
             await asyncio.sleep(3)
             
