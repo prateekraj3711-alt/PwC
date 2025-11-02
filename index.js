@@ -220,6 +220,64 @@ app.get('/', (req, res) => {
   });
 });
 
+// Helper function to clean up old session files (older than 5 minutes)
+async function cleanupOldSessions() {
+  try {
+    const baseDir = await ensureTmpDir();
+    const files = await fs.readdir(baseDir).catch(() => []);
+    const jsonFiles = files.filter(f => f.endsWith('.json'));
+    const now = Date.now();
+    const maxAge = 5 * 60 * 1000; // 5 minutes
+    
+    for (const file of jsonFiles) {
+      try {
+        const filePath = path.join(baseDir, file);
+        const stats = await fs.stat(filePath);
+        const age = now - stats.mtimeMs;
+        
+        if (age > maxAge) {
+          await fs.unlink(filePath).catch(() => {});
+          console.log(`[Cleanup] Deleted old session file: ${file} (age: ${Math.round(age / 1000)}s)`);
+        }
+      } catch (e) {
+        // Ignore errors for individual files
+      }
+    }
+  } catch (err) {
+    console.warn(`[Cleanup] Error cleaning old sessions: ${err.message}`);
+  }
+}
+
+// Helper function to destroy all existing browser contexts
+async function destroyAllBrowserContexts() {
+  try {
+    // Close all existing browser sessions
+    for (const [sessionId, session] of sessions.entries()) {
+      try {
+        if (session.browser) {
+          await session.browser.close().catch(() => {});
+        }
+      } catch (e) {
+        // Ignore errors
+      }
+      sessions.delete(sessionId);
+    }
+    
+    // Also clean up session files
+    const baseDir = await ensureTmpDir();
+    const files = await fs.readdir(baseDir).catch(() => []);
+    for (const file of files) {
+      if (file.endsWith('.json')) {
+        await fs.unlink(path.join(baseDir, file)).catch(() => {});
+      }
+    }
+    
+    console.log('[Session Isolation] Destroyed all existing browser contexts and session files');
+  } catch (err) {
+    console.warn(`[Session Isolation] Error destroying contexts: ${err.message}`);
+  }
+}
+
 app.post('/start-login', async (req, res) => {
   let browser = null;
   try {
@@ -230,6 +288,12 @@ app.post('/start-login', async (req, res) => {
         details: { step: 'start-login' }
       });
     }
+
+    // CRITICAL: Destroy all existing contexts before creating new one
+    await destroyAllBrowserContexts();
+    
+    // Clean up old session files (older than 5 minutes)
+    await cleanupOldSessions();
 
     const sessionId = uuidv4();
     const stateToken = uuidv4();
@@ -392,6 +456,7 @@ app.post('/start-login', async (req, res) => {
     
     try {
       await fs.writeFile(sessionPath, JSON.stringify(storageState), 'utf-8');
+      console.log(`[Session] Saved new session to: ${sessionPath}`);
     } catch (saveErr) {
       return res.status(500).json({
         ok: false,
@@ -399,6 +464,9 @@ app.post('/start-login', async (req, res) => {
         details: { step: 'start-login', error: saveErr.message }
       });
     }
+    
+    // Clean up old sessions again after creating new one
+    await cleanupOldSessions();
 
     sessions.set(sessionId, {
       browser,
@@ -452,7 +520,21 @@ app.post('/complete-login', async (req, res) => {
       });
     }
 
-    let effectiveSessionId = session_id || latestSessionId;
+    // CRITICAL: Destroy any other existing contexts to ensure session isolation
+    // Keep only the current session being completed
+    const currentSessionId = session_id || latestSessionId;
+    for (const [sessionId, session] of sessions.entries()) {
+      if (sessionId !== currentSessionId) {
+        try {
+          if (session.browser) {
+            await session.browser.close().catch(() => {});
+          }
+        } catch (e) {}
+        sessions.delete(sessionId);
+      }
+    }
+
+    let effectiveSessionId = currentSessionId;
     
     if (!effectiveSessionId) {
       const activeSessions = Array.from(sessions.keys());
@@ -809,7 +891,13 @@ app.post('/complete-login', async (req, res) => {
     const storageState = await context.storageState();
     try {
       await fs.writeFile(sessionPath, JSON.stringify(storageState), 'utf-8');
-    } catch (saveErr) {}
+      console.log(`[Session] Saved complete login session to: ${sessionPath}`);
+    } catch (saveErr) {
+      console.error(`[Session] Failed to save session: ${saveErr.message}`);
+    }
+    
+    // Clean up old session files (older than 5 minutes) after successful login
+    await cleanupOldSessions();
 
     session.expiry = Date.now() + SESSION_TTL;
     sessions.set(effectiveSessionId, session);
