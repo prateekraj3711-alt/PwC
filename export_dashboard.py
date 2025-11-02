@@ -47,66 +47,69 @@ def get_sheets_service():
     try:
         creds_json = GOOGLE_CREDENTIALS_JSON
         
-        # Clean control characters from JSON string (except newlines/tabs in string values)
-        # This handles cases where the environment variable has invalid control characters
-        def clean_json_string(s):
-            # Remove control characters except newline, carriage return, tab
-            # But preserve them if they're inside JSON string values
-            result = []
-            in_string = False
-            escape_next = False
-            for i, char in enumerate(s):
-                if escape_next:
-                    result.append(char)
-                    escape_next = False
-                    continue
-                if char == '\\':
-                    escape_next = True
-                    result.append(char)
-                    continue
-                if char == '"' and (i == 0 or s[i-1] != '\\'):
-                    in_string = not in_string
-                    result.append(char)
-                    continue
-                # Keep all characters in JSON structure (outside strings) and printable chars
-                # Also keep newline/cr/tab inside strings (for private_key)
-                if ord(char) >= 32 or char in '\n\r\t' or (in_string and char in '\n\r\t'):
-                    result.append(char)
-                elif ord(char) < 32:
-                    # Replace control character with space (safe for JSON parsing)
-                    result.append(' ')
-            return ''.join(result)
+        # Handle the case where JSON might have been stored with actual newlines
+        # or where the private_key has literal \n characters that need to be parsed
         
-        # Clean the JSON string
-        creds_json_cleaned = clean_json_string(creds_json)
-        
-        # Handle multiple levels of escaping
+        # Strategy: Try multiple parsing approaches
         creds_info = None
         parse_errors = []
         
-        # Try 1: Direct JSON parse (cleaned)
+        # Try 1: Direct JSON parse (if properly formatted)
         try:
-            creds_info = json.loads(creds_json_cleaned)
+            creds_info = json.loads(creds_json)
         except json.JSONDecodeError as e1:
             parse_errors.append(f"Direct parse: {e1}")
-            # Try 2: Replace escaped newlines
+            
+            # Try 2: Replace literal newlines with escaped \n (for private_key)
+            # This handles cases where the env var was pasted with actual newlines
             try:
-                creds_json_fixed = creds_json_cleaned.replace("\\n", "\n").replace("\\r", "\r")
-                creds_info = json.loads(creds_json_fixed)
-            except json.JSONDecodeError as e2:
-                parse_errors.append(f"Newline replace: {e2}")
-                # Try 3: Use codecs unicode_escape
+                # Remove any actual newlines outside of string values
+                # But preserve \n escape sequences inside strings
+                import re
+                # Replace actual newlines that are not part of an escape sequence
+                # Pattern: newline not preceded by backslash
+                fixed_json = re.sub(r'(?<!\\)\n', '\\\\n', creds_json)
+                fixed_json = re.sub(r'(?<!\\)\r', '\\\\r', fixed_json)
+                # Now unescape: convert \\n back to \n for JSON parsing
+                fixed_json = fixed_json.replace('\\\\n', '\\n').replace('\\\\r', '\\r')
+                creds_info = json.loads(fixed_json)
+            except (json.JSONDecodeError, Exception) as e2:
+                parse_errors.append(f"Newline fix: {e2}")
+                
+                # Try 3: Base64 decode if it looks encoded
                 try:
-                    import codecs
-                    # Only decode if there are actual escape sequences
-                    if '\\n' in creds_json_cleaned or '\\r' in creds_json_cleaned:
-                        creds_json_fixed = codecs.decode(creds_json_cleaned, 'unicode_escape')
-                        creds_info = json.loads(creds_json_fixed)
-                    else:
-                        raise json.JSONDecodeError("No escape sequences found", creds_json_cleaned, 0)
-                except (json.JSONDecodeError, UnicodeDecodeError) as e3:
-                    parse_errors.append(f"Unicode escape: {e3}")
-                    raise ValueError(f"Failed to parse GOOGLE_CREDENTIALS_JSON. Errors: {parse_errors}")
+                    import base64
+                    # Check if it's base64 encoded
+                    decoded = base64.b64decode(creds_json).decode('utf-8')
+                    creds_info = json.loads(decoded)
+                except Exception as e3:
+                    parse_errors.append(f"Base64 decode: {e3}")
+                    
+                    # Try 4: Manual reconstruction (last resort)
+                    # Extract key parts and rebuild JSON
+                    try:
+                        # Try to find the pattern and fix it manually
+                        # The error suggests issue at column 166 (likely in private_key)
+                        # Try removing control characters from private_key value
+                        import re
+                        # Pattern: "private_key": "value"
+                        pattern = r'"private_key"\s*:\s*"([^"]*)"'
+                        match = re.search(pattern, creds_json)
+                        if match:
+                            # Get the private key value
+                            pk_value = match.group(1)
+                            # Clean it - replace actual newlines with \n
+                            pk_cleaned = pk_value.replace('\n', '\\n').replace('\r', '\\r')
+                            # Replace in original JSON
+                            fixed_json = creds_json.replace(f'"private_key": "{pk_value}"', f'"private_key": "{pk_cleaned}"')
+                            creds_info = json.loads(fixed_json)
+                        else:
+                            raise ValueError("Could not find private_key in JSON")
+                    except Exception as e4:
+                        parse_errors.append(f"Manual fix: {e4}")
+                        logger.error(f"All parsing attempts failed. Errors: {parse_errors}")
+                        logger.error(f"JSON sample (first 300 chars): {creds_json[:300]}")
+                        raise ValueError(f"Failed to parse GOOGLE_CREDENTIALS_JSON after all attempts. Errors: {parse_errors}")
         
         # Validate the structure
         if not isinstance(creds_info, dict):
@@ -114,8 +117,8 @@ def get_sheets_service():
         
         # Ensure private_key has actual newlines (not escaped strings)
         if 'private_key' in creds_info and isinstance(creds_info['private_key'], str):
-            # Replace literal \n with actual newlines if needed
-            if '\\n' in creds_info['private_key']:
+            # Replace literal \n with actual newlines (if they're still escaped)
+            if '\\n' in creds_info['private_key'] and '\n' not in creds_info['private_key']:
                 creds_info['private_key'] = creds_info['private_key'].replace('\\n', '\n')
         
         creds = service_account.Credentials.from_service_account_info(
@@ -126,7 +129,7 @@ def get_sheets_service():
     except Exception as e:
         logger.error(f"Failed to parse GOOGLE_CREDENTIALS_JSON: {e}")
         logger.error(f"JSON length: {len(GOOGLE_CREDENTIALS_JSON) if GOOGLE_CREDENTIALS_JSON else 0}")
-        logger.error(f"First 200 chars: {GOOGLE_CREDENTIALS_JSON[:200] if GOOGLE_CREDENTIALS_JSON else 'N/A'}")
+        logger.error(f"First 300 chars: {GOOGLE_CREDENTIALS_JSON[:300] if GOOGLE_CREDENTIALS_JSON else 'N/A'}")
         raise ValueError(f"Invalid GOOGLE_CREDENTIALS_JSON: {e}")
 
 
