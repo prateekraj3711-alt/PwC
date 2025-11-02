@@ -249,61 +249,96 @@ async function cleanupOldSessions() {
 }
 
 // Helper function to destroy all existing browser contexts
+// CRITICAL: This function ensures complete cleanup of all previous sessions
 async function destroyAllBrowserContexts() {
   try {
-    // First, try to log out from PwC before closing browsers
+    console.log('[Session Isolation] Starting complete cleanup of all previous sessions...');
+    const sessionCount = sessions.size;
+    console.log(`[Session Isolation] Found ${sessionCount} active session(s) to destroy`);
+    
+    // Step 1: Log out from PwC for all active sessions (critical for preventing concurrent sessions)
     const logoutPromises = [];
     for (const [sessionId, session] of sessions.entries()) {
       try {
         if (session.page && !session.page.isClosed()) {
-          // Try to navigate to logout URL
+          console.log(`[Session Isolation] Logging out session ${sessionId} from PwC...`);
+          // Try to navigate to logout URL for each session
           logoutPromises.push(
             session.page.goto('https://compliancenominationportal.in.pwc.com/Account/LogOff', { timeout: 10000 }).catch(() => {})
           );
         }
       } catch (e) {
-        // Ignore errors
+        console.warn(`[Session Isolation] Could not logout session ${sessionId}: ${e.message}`);
       }
     }
     
-    // Wait for logout attempts (don't wait too long)
-    await Promise.allSettled(logoutPromises);
-    await new Promise(resolve => setTimeout(resolve, 2000)); // Brief wait for logout
+    // Wait for all logout attempts to complete
+    if (logoutPromises.length > 0) {
+      await Promise.allSettled(logoutPromises);
+      await new Promise(resolve => setTimeout(resolve, 3000)); // Wait 3s for logout to process
+      console.log(`[Session Isolation] Completed logout attempts for ${logoutPromises.length} session(s)`);
+    }
     
-    // Now close all browsers
+    // Step 2: Close all browser instances
     const closePromises = [];
     for (const [sessionId, session] of sessions.entries()) {
       try {
         if (session.browser) {
+          console.log(`[Session Isolation] Closing browser for session ${sessionId}...`);
           closePromises.push(session.browser.close().catch(() => {}));
         }
       } catch (e) {
-        // Ignore errors
+        console.warn(`[Session Isolation] Error closing browser for session ${sessionId}: ${e.message}`);
       }
       sessions.delete(sessionId);
     }
     
     // Wait for all browsers to close
-    await Promise.all(closePromises);
+    if (closePromises.length > 0) {
+      await Promise.all(closePromises);
+      console.log(`[Session Isolation] Closed ${closePromises.length} browser instance(s)`);
+    }
     
-    // Also clean up session files
+    // Step 3: Delete all session files from disk
     const baseDir = await ensureTmpDir();
     const files = await fs.readdir(baseDir).catch(() => []);
+    const jsonFiles = files.filter(f => f.endsWith('.json'));
+    console.log(`[Session Isolation] Found ${jsonFiles.length} session file(s) to delete`);
+    
     const deletePromises = [];
-    for (const file of files) {
-      if (file.endsWith('.json')) {
-        deletePromises.push(fs.unlink(path.join(baseDir, file)).catch(() => {}));
+    for (const file of jsonFiles) {
+      try {
+        const filePath = path.join(baseDir, file);
+        deletePromises.push(
+          fs.unlink(filePath).then(() => {
+            console.log(`[Session Isolation] Deleted session file: ${file}`);
+          }).catch(() => {})
+        );
+      } catch (e) {
+        // Ignore individual file errors
       }
     }
-    await Promise.all(deletePromises);
     
-    // CRITICAL: Wait longer (10 seconds) for PwC server to recognize all sessions are closed
-    // This ensures no concurrent session conflicts
+    if (deletePromises.length > 0) {
+      await Promise.all(deletePromises);
+      console.log(`[Session Isolation] Deleted ${jsonFiles.length} session file(s) from disk`);
+    }
+    
+    // Step 4: Clear in-memory session tracking
+    latestSessionId = null;
+    
+    // Step 5: CRITICAL - Wait for PwC server to recognize all sessions are closed
+    // This ensures no concurrent session conflicts when creating new login
     await new Promise(resolve => setTimeout(resolve, 10000));
     
-    console.log('[Session Isolation] Destroyed all existing browser contexts and session files. Waited 10s for PwC server to recognize closure.');
+    console.log('[Session Isolation] ✅ Complete cleanup finished. All previous sessions destroyed.');
+    console.log(`[Session Isolation] Summary: ${sessionCount} session(s) destroyed, ${jsonFiles.length} file(s) deleted, waited 10s for PwC server recognition`);
   } catch (err) {
-    console.warn(`[Session Isolation] Error destroying contexts: ${err.message}`);
+    console.error(`[Session Isolation] ❌ Error during cleanup: ${err.message}`);
+    console.error(`[Session Isolation] Stack: ${err.stack}`);
+    // Still try to clear sessions map even if cleanup fails
+    sessions.clear();
+    latestSessionId = null;
   }
 }
 
@@ -318,11 +353,21 @@ app.post('/start-login', async (req, res) => {
       });
     }
 
-    // CRITICAL: Destroy all existing contexts before creating new one
+    // CRITICAL: Destroy ALL previous sessions before creating new one
+    // This ensures only one session exists at any time
+    console.log('[Start-Login] Initiating complete cleanup of all previous sessions...');
     await destroyAllBrowserContexts();
     
-    // Clean up old session files (older than 5 minutes)
+    // Additional cleanup: Remove any session files older than 5 minutes (safety net)
     await cleanupOldSessions();
+    
+    // Verify cleanup was successful
+    if (sessions.size > 0) {
+      console.warn(`[Start-Login] ⚠️ Warning: ${sessions.size} session(s) still in memory after cleanup`);
+      sessions.clear(); // Force clear
+    }
+    
+    console.log('[Start-Login] Cleanup verified. Creating new login session...');
 
     const sessionId = uuidv4();
     const stateToken = uuidv4();
@@ -549,19 +594,48 @@ app.post('/complete-login', async (req, res) => {
       });
     }
 
-    // CRITICAL: Destroy any other existing contexts to ensure session isolation
+    // CRITICAL: Destroy ALL other existing contexts and session files
     // Keep only the current session being completed
     const currentSessionId = session_id || latestSessionId;
+    console.log(`[Complete-Login] Destroying all sessions except ${currentSessionId}...`);
+    
+    const baseDir = await ensureTmpDir();
+    const files = await fs.readdir(baseDir).catch(() => []);
+    const jsonFiles = files.filter(f => f.endsWith('.json'));
+    
+    // Delete all session files EXCEPT the current one
+    const deletePromises = [];
+    for (const file of jsonFiles) {
+      const fileSessionId = file.replace('.json', '');
+      if (fileSessionId !== currentSessionId) {
+        try {
+          const filePath = path.join(baseDir, file);
+          deletePromises.push(
+            fs.unlink(filePath).then(() => {
+              console.log(`[Complete-Login] Deleted old session file: ${file}`);
+            }).catch(() => {})
+          );
+        } catch (e) {}
+      }
+    }
+    await Promise.all(deletePromises);
+    
+    // Close all browser instances EXCEPT the current one
     for (const [sessionId, session] of sessions.entries()) {
       if (sessionId !== currentSessionId) {
         try {
           if (session.browser) {
+            console.log(`[Complete-Login] Closing browser for session ${sessionId}...`);
             await session.browser.close().catch(() => {});
           }
-        } catch (e) {}
+        } catch (e) {
+          console.warn(`[Complete-Login] Error closing browser for session ${sessionId}: ${e.message}`);
+        }
         sessions.delete(sessionId);
       }
     }
+    
+    console.log(`[Complete-Login] Cleaned up ${deletePromises.length} old session file(s) and ${sessions.size === 1 ? 0 : sessions.size - 1} old session(s)`);
 
     let effectiveSessionId = currentSessionId;
     
