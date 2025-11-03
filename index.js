@@ -1070,9 +1070,10 @@ app.post('/complete-login', async (req, res) => {
         console.log(`[Auto-Export] Triggering export for session ${effectiveSessionId}...`);
         console.log(`[Auto-Export] Export service URL: ${exportServiceUrl}/export-dashboard`);
         
-        // ROOT FIX: Increased timeout for Render services (can take 30-60s to wake up on free tier)
-        // Also add retry logic for better reliability
-        const FETCH_TIMEOUT = 120000; // 2 minutes (Render services can take time to wake up)
+        // ROOT FIX: Wake up service first with health check, then call export endpoint
+        // Render free tier services can sleep - health check wakes them up faster
+        const HEALTH_CHECK_TIMEOUT = 30000; // 30 seconds for health check
+        const FETCH_TIMEOUT = 300000; // 5 minutes for export (export takes time)
         const MAX_RETRIES = 3;
         const RETRY_DELAY = 10000; // 10 seconds between retries
         
@@ -1083,6 +1084,32 @@ app.post('/complete-login', async (req, res) => {
           try {
             console.log(`[Auto-Export] Attempt ${attempt}/${MAX_RETRIES} to connect to export service...`);
             
+            // STEP 1: Wake up service with health check (faster than waiting for export endpoint)
+            console.log(`[Auto-Export] 🔔 Waking up service with health check...`);
+            try {
+              const healthController = new AbortController();
+              const healthTimeoutId = setTimeout(() => healthController.abort(), HEALTH_CHECK_TIMEOUT);
+              
+              const healthResponse = await fetch(`${exportServiceUrl}/health`, {
+                method: 'GET',
+                signal: healthController.signal
+              }).catch(() => null);
+              
+              clearTimeout(healthTimeoutId);
+              
+              if (healthResponse && healthResponse.ok) {
+                console.log(`[Auto-Export] ✅ Service is awake (health check OK)`);
+              } else {
+                console.log(`[Auto-Export] ⏳ Service may be waking up...`);
+                await new Promise(resolve => setTimeout(resolve, 5000)); // Wait 5s after health check
+              }
+            } catch (healthErr) {
+              console.log(`[Auto-Export] ⏳ Health check timeout (service waking up), proceeding anyway...`);
+              await new Promise(resolve => setTimeout(resolve, 5000)); // Wait 5s
+            }
+            
+            // STEP 2: Call export endpoint (now service should be awake)
+            console.log(`[Auto-Export] 📤 Calling export endpoint...`);
             const controller = new AbortController();
             const timeoutId = setTimeout(() => controller.abort(), FETCH_TIMEOUT);
             
