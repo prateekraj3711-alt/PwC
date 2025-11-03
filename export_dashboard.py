@@ -137,21 +137,125 @@ async def incremental_sync(tab_name: str, excel_path: Path, spreadsheet_id: str,
     """
     Incremental sync: Read Excel, compare with existing Google Sheet data, upload new/changed rows.
     
+    ROOT FIX: Each file is read with fresh context, explicit file closing, no global state reuse.
+    
     Returns: {"tab": tab_name, "new": count, "updated": count, "skipped": count, "rows": total_rows}
     """
+    # ROOT FIX: Ensure fresh state for this tab - no global variables reused
+    df_new = None
+    file_handle = None
+    
     try:
-        logger.info(f"📊 Starting incremental sync for {tab_name}...")
+        logger.info(f"\n{'='*70}")
+        logger.info(f"📊 Starting incremental sync for '{tab_name}'")
+        logger.info(f"{'='*70}")
         
-        # Step 1: Read Excel file
+        # Step 1: Verify file exists and get metadata
         if not excel_path.exists():
             raise FileNotFoundError(f"Excel file not found: {excel_path}")
         
-        logger.info(f"📖 Reading Excel file: {excel_path}")
-        df_new = pd.read_excel(excel_path, engine='openpyxl')
+        # Get file metadata BEFORE opening
+        file_stat = excel_path.stat()
+        file_size = file_stat.st_size
+        file_mtime = file_stat.st_mtime
+        logger.info(f"📁 File: {excel_path.name}")
+        logger.info(f"📦 File size: {file_size} bytes")
+        logger.info(f"🕒 File modified: {datetime.fromtimestamp(file_mtime).isoformat()}")
         
-        if df_new.empty:
-            logger.warning(f"⚠️ Excel file for {tab_name} is empty")
+        # ROOT FIX: Read Excel file with explicit context management
+        # Using open() context manager ensures file is closed immediately after read
+        logger.info(f"📖 Opening Excel file with fresh context: {excel_path}")
+        
+        # Force garbage collection before reading to clear any cached data
+        import gc
+        gc.collect()
+        
+        # ROOT FIX: Read file with explicit open context - ensures fresh read each time
+        # pandas read_excel will handle the file internally, but we ensure it's a fresh read
+        try:
+            # Open file explicitly to ensure fresh read (pandas will use it)
+            with open(excel_path, 'rb') as f:
+                # Read entire file into memory first to ensure we have fresh data
+                file_content = f.read()
+                file_content_size = len(file_content)
+                logger.info(f"✅ File read into memory: {file_content_size} bytes")
+                
+                # Close file handle immediately
+                f.close()
+            
+            # ROOT FIX: Now read from memory buffer using BytesIO - completely isolated
+            from io import BytesIO
+            excel_buffer = BytesIO(file_content)
+            
+            # Clear the file_content from memory after creating buffer
+            del file_content
+            gc.collect()
+            
+            # Read from buffer - each call gets fresh data
+            df_new = pd.read_excel(excel_buffer, engine='openpyxl')
+            
+            # Explicitly close the buffer
+            excel_buffer.close()
+            del excel_buffer
+            gc.collect()
+            
+            logger.info(f"✅ Excel file parsed successfully (file handle closed)")
+            
+        except Exception as read_err:
+            logger.error(f"❌ Error reading Excel file: {read_err}")
+            raise
+        
+        # ROOT FIX: Verify we got data and log detailed info
+        if df_new is None or df_new.empty:
+            logger.warning(f"⚠️ Excel file for {tab_name} is empty or could not be read")
             return {"tab": tab_name, "new": 0, "updated": 0, "skipped": 0, "rows": 0, "error": "Excel file is empty"}
+        
+        # Log actual row count and verify uniqueness
+        row_count = len(df_new)
+        col_count = len(df_new.columns)
+        logger.info(f"📊 Loaded {row_count} rows, {col_count} columns from Excel file")
+        
+        # ROOT FIX: Per-tab verification log BEFORE uploading
+        logger.info(f"\n{'='*70}")
+        logger.info(f"🔍 PER-TAB VERIFICATION FOR '{tab_name}'")
+        logger.info(f"{'='*70}")
+        logger.info(f"📁 Source file: {excel_path.name}")
+        logger.info(f"📦 File size: {file_size} bytes")
+        logger.info(f"📊 Row count: {row_count}")
+        logger.info(f"📋 Column count: {col_count}")
+        
+        # Log column names to verify structure
+        if col_count > 0:
+            logger.info(f"📋 Columns: {list(df_new.columns[:10])}" + ("..." if col_count > 10 else ""))
+        
+        # Log sample data from first and last rows to verify content uniqueness
+        if row_count > 0:
+            # First row sample
+            first_row = df_new.iloc[0]
+            first_row_data = {}
+            sample_cols = list(df_new.columns)[:5]  # First 5 columns
+            for col in sample_cols:
+                val = first_row.get(col, '')
+                first_row_data[col] = str(val)[:50]  # First 50 chars
+            logger.info(f"🔍 First row sample: {first_row_data}")
+            
+            # Last row sample (if multiple rows)
+            if row_count > 1:
+                last_row = df_new.iloc[-1]
+                last_row_data = {}
+                for col in sample_cols:
+                    val = last_row.get(col, '')
+                    last_row_data[col] = str(val)[:50]
+                logger.info(f"🔍 Last row sample: {last_row_data}")
+            
+            # Check for key column
+            if key_col in df_new.columns:
+                unique_keys = df_new[key_col].nunique()
+                logger.info(f"🔑 Key column '{key_col}': {unique_keys} unique values")
+            else:
+                logger.warning(f"⚠️ Key column '{key_col}' not found in data")
+        
+        logger.info(f"{'='*70}\n")
         
         # Clean control characters from Excel data immediately after reading
         def clean_excel_value(val):
@@ -162,18 +266,28 @@ async def incremental_sync(tab_name: str, excel_path: Path, spreadsheet_id: str,
             cleaned = ''.join(char if ord(char) >= 32 or char in '\n\r\t' else ' ' for char in val_str)
             return cleaned
         
+        # ROOT FIX: Create fresh copy for cleaning to avoid modifying original
+        df_working = df_new.copy()
+        
         # Clean all object (string) columns
-        for col in df_new.select_dtypes(include=['object']).columns:
-            df_new[col] = df_new[col].apply(clean_excel_value)
+        for col in df_working.select_dtypes(include=['object']).columns:
+            df_working[col] = df_working[col].apply(clean_excel_value)
         
         # Clean column names
-        df_new.columns = [clean_excel_value(str(col)) for col in df_new.columns]
+        df_working.columns = [clean_excel_value(str(col)) for col in df_working.columns]
         
         # Add timestamp column
-        if "LastSyncedAt" not in df_new.columns:
-            df_new["LastSyncedAt"] = datetime.now().isoformat()
+        sync_timestamp = datetime.now().isoformat()
+        if "LastSyncedAt" not in df_working.columns:
+            df_working["LastSyncedAt"] = sync_timestamp
         else:
-            df_new["LastSyncedAt"] = datetime.now().isoformat()
+            df_working["LastSyncedAt"] = sync_timestamp
+        
+        # ROOT FIX: Clear original df_new and use cleaned version
+        del df_new
+        df_new = df_working
+        del df_working
+        gc.collect()
         
         logger.info(f"✅ Loaded {len(df_new)} rows from Excel (cleaned control characters)")
         
@@ -354,26 +468,66 @@ async def incremental_sync(tab_name: str, excel_path: Path, spreadsheet_id: str,
         
         logger.info(f"✅ Successfully uploaded {len(df_final)} rows to sheet '{sheet_name}'")
         
-        return {
+        # ROOT FIX: Explicit cleanup before returning
+        result = {
             "tab": tab_name,
             "new": new_count,
             "updated": updated_count,
             "skipped": skipped_count,
             "rows": len(df_final),
-            "sheet": sheet_name
+            "sheet": sheet_name,
+            "file_size_bytes": file_size
         }
+        
+        # Clear all dataframes from memory
+        del df_final
+        if 'df_new' in locals():
+            del df_new
+        if 'df_existing' in locals():
+            del df_existing
+        gc.collect()
+        
+        logger.info(f"✅ Completed sync for '{tab_name}' (memory cleared)")
+        return result
         
     except Exception as e:
         logger.error(f"❌ Incremental sync error for {tab_name}: {e}")
+        import traceback
+        logger.error(f"❌ Traceback: {traceback.format_exc()}")
+        
+        # ROOT FIX: Ensure cleanup on error
+        if 'df_new' in locals() and df_new is not None:
+            del df_new
+        if 'file_handle' in locals() and file_handle is not None:
+            try:
+                file_handle.close()
+            except:
+                pass
+        gc.collect()
         raise
 
 
 async def sync_all_tabs_to_sheets(download_dir: Path, spreadsheet_id: str):
-    """Upload all exported Excel files to Google Sheets"""
+    """
+    Upload all exported Excel files to Google Sheets.
+    
+    ROOT FIX: Each tab is processed independently with fresh context.
+    """
+    import gc
+    
     tab_results = []
     
-    for tab in TABS:
+    logger.info(f"\n{'='*70}")
+    logger.info(f"🚀 Starting sync for {len(TABS)} tabs")
+    logger.info(f"📁 Download directory: {download_dir}")
+    logger.info(f"{'='*70}\n")
+    
+    for idx, tab in enumerate(TABS, 1):
         try:
+            logger.info(f"\n{'='*70}")
+            logger.info(f"📋 Processing tab {idx}/{len(TABS)}: {tab}")
+            logger.info(f"{'='*70}")
+            
             excel_path = download_dir / f"{tab}.xlsx"
             
             if not excel_path.exists():
@@ -381,13 +535,30 @@ async def sync_all_tabs_to_sheets(download_dir: Path, spreadsheet_id: str):
                 tab_results.append({"tab": tab, "status": "error", "error": "Excel file not found"})
                 continue
             
+            # ROOT FIX: Process each tab independently with explicit cleanup between tabs
             result = await incremental_sync(tab, excel_path, spreadsheet_id)
             tab_results.append(result)
-            logger.info(f"✅ Completed sync for {tab}")
+            
+            # ROOT FIX: Explicit cleanup between tabs
+            gc.collect()
+            logger.info(f"✅ Completed sync for {tab} (tab {idx}/{len(TABS)})")
+            
+            # Small delay between tabs to ensure file system is ready
+            if idx < len(TABS):
+                await asyncio.sleep(1)
             
         except Exception as e:
             logger.error(f"❌ Error syncing {tab} to Sheets: {e}")
+            import traceback
+            logger.error(f"❌ Traceback: {traceback.format_exc()}")
             tab_results.append({"tab": tab, "status": "error", "error": str(e)})
+            
+            # ROOT FIX: Cleanup on error
+            gc.collect()
+    
+    logger.info(f"\n{'='*70}")
+    logger.info(f"✅ Completed sync for all {len(TABS)} tabs")
+    logger.info(f"{'='*70}\n")
     
     return tab_results
 
@@ -568,7 +739,61 @@ async def export_tab(page: Page, tab_name: str, download_dir: Path):
     if not tab_clicked:
         raise Exception(f"Could not click tab: {tab_name}")
     
-    await wait_full_load(page, 25, f"tab {tab_name}")
+    # CRITICAL: Wait for tab content to actually load and verify tab name is visible/active
+    logger.info(f"⏳ Waiting for tab '{tab_name}' content to load (30s)...")
+    await asyncio.sleep(10)  # Initial wait for tab switch
+    
+    # Verify tab is active/selected (check for active class, aria-selected, or tab name in page)
+    max_verification_attempts = 10
+    tab_verified = False
+    for attempt in range(max_verification_attempts):
+        try:
+            # Check if tab is active/selected by looking for active indicators
+            active_indicators = [
+                f'text="{tab_name}" >> ..active',
+                f'text="{tab_name}" >> ..selected',
+                f'a:has-text("{tab_name}") >> ..active',
+                f'button:has-text("{tab_name}") >> ..active',
+                f'[data-tab*="{tab_name}"][class*="active"]',
+                f'[aria-label*="{tab_name}"][aria-selected="true"]',
+            ]
+            
+            # Also check if page content includes the tab name or related indicators
+            page_content = await page.content()
+            page_text = await page.text_content()
+            
+            # Check if tab name appears in active elements or page indicators
+            for indicator in active_indicators:
+                try:
+                    element = await page.query_selector(indicator)
+                    if element:
+                        tab_verified = True
+                        logger.info(f"✅ Verified tab '{tab_name}' is active (attempt {attempt+1})")
+                        break
+                except:
+                    continue
+            
+            # Also verify by checking if tab name appears in visible text/content
+            if tab_name.lower() in (page_text or "").lower()[:1000]:  # Check first 1000 chars
+                tab_verified = True
+                logger.info(f"✅ Verified tab '{tab_name}' content is visible (attempt {attempt+1})")
+            
+            if tab_verified:
+                break
+            
+            await asyncio.sleep(2)  # Wait 2 seconds before next verification attempt
+            
+        except Exception as verify_err:
+            logger.debug(f"Verification attempt {attempt+1} failed: {verify_err}")
+            await asyncio.sleep(2)
+    
+    if not tab_verified:
+        logger.warning(f"⚠️ Could not verify tab '{tab_name}' is active, proceeding anyway...")
+    else:
+        logger.info(f"✅ Tab '{tab_name}' verified and ready for export")
+    
+    # Additional wait for full content load
+    await wait_full_load(page, 20, f"tab {tab_name}")
 
     # Step 3: Click "Export to excel" button
     # CRITICAL: Export button appears AFTER Advance search is clicked and tab is selected
@@ -672,14 +897,43 @@ async def export_tab(page: Page, tab_name: str, download_dir: Path):
         raise Exception(f"Download timeout for {tab_name}")
 
     await asyncio.sleep(2)
+    
+    # CRITICAL: Verify the downloaded file exists and has content
+    if not file_path.exists():
+        raise Exception(f"Downloaded file not found: {file_path}")
+    
+    file_size = file_path.stat().st_size
+    logger.info(f"📦 Downloaded file size: {file_size} bytes for '{tab_name}'")
+    
+    if file_size < 100:  # Excel files should be at least 100 bytes (headers)
+        raise Exception(f"Downloaded file too small ({file_size} bytes) - likely empty or corrupted")
+    
+    # Quick verification: Read first few rows to ensure it's not empty
+    try:
+        import pandas as pd
+        df_check = pd.read_excel(file_path, engine='openpyxl', nrows=5)
+        row_count_check = len(df_check)
+        logger.info(f"✅ File verification: {row_count_check} rows in preview (file size: {file_size} bytes)")
+        
+        if row_count_check == 0:
+            raise Exception(f"Downloaded Excel file appears empty (0 rows found)")
+        
+        # Log a sample of column names to help debug
+        if len(df_check.columns) > 0:
+            logger.info(f"📋 File columns preview: {list(df_check.columns[:5])}")
+    except Exception as verify_err:
+        logger.warning(f"⚠️ Could not verify file content (non-critical): {verify_err}")
+        # Don't fail - file exists and has size, that's good enough
+    
+    # Final verification before returning
     if not file_path.exists() or file_path.stat().st_size == 0:
         raise Exception(f"File missing or empty for {tab_name}")
 
     await asyncio.sleep(1)
-    file_size = file_path.stat().st_size
-    logger.info(f"✅ Step 4: Export completed for {tab_name} ({file_size} bytes)")
+    final_file_size = file_path.stat().st_size
+    logger.info(f"✅ Step 4: Export completed for {tab_name} ({final_file_size} bytes)")
     logger.info(f"✅ ✅ Tab '{tab_name}' export workflow finished successfully")
-    return {"tab": tab_name, "status": "done", "file_size": file_size}
+    return {"tab": tab_name, "status": "done", "file_size": final_file_size}
 
 
 async def perform_logout(page: Page):
@@ -1230,25 +1484,44 @@ async def upload_to_sheets_only(req: Optional[UploadRequest] = None):
         
         download_dir = TMP_DIR / "dashboard_exports"
         
+        # Create directory if it doesn't exist (harmless if no files)
+        download_dir.mkdir(parents=True, exist_ok=True)
+        
         if not download_dir.exists():
             raise HTTPException(
-                status_code=404,
-                detail=f"Export directory not found: {download_dir}. Run full export first to generate Excel files."
+                status_code=500,
+                detail=f"Could not create export directory: {download_dir}"
             )
         
         # Check which Excel files exist
         existing_files = []
+        missing_files = []
         for tab in TABS:
             excel_path = download_dir / f"{tab}.xlsx"
             if excel_path.exists():
                 file_size = excel_path.stat().st_size
                 existing_files.append({"tab": tab, "file": str(excel_path), "size_bytes": file_size})
+            else:
+                missing_files.append(tab)
         
         if not existing_files:
+            error_msg = (
+                f"No Excel files found in {download_dir}. "
+                f"Expected files: {', '.join([f'{tab}.xlsx' for tab in TABS[:3]])}... "
+                f"\n\nTo generate files:\n"
+                f"1. Wait for scheduled login/export (every 4 hours)\n"
+                f"2. Or trigger full export: POST /export-dashboard\n"
+                f"3. Files must be generated before upload."
+            )
             raise HTTPException(
                 status_code=404,
-                detail=f"No Excel files found in {download_dir}. Files must exist before upload."
+                detail=error_msg
             )
+        
+        # Log missing files as warnings (if some files exist, continue with available ones)
+        if missing_files:
+            logger.warning(f"⚠️ Missing Excel files for {len(missing_files)} tab(s): {', '.join(missing_files)}")
+            logger.info(f"📁 Found {len(existing_files)} Excel file(s) - will upload available files only")
         
         logger.info(f"📁 Found {len(existing_files)} Excel file(s) to upload:")
         for file_info in existing_files:
