@@ -1070,47 +1070,108 @@ app.post('/complete-login', async (req, res) => {
         console.log(`[Auto-Export] Triggering export for session ${effectiveSessionId}...`);
         console.log(`[Auto-Export] Export service URL: ${exportServiceUrl}/export-dashboard`);
         
-        // Add timeout to fetch (30 seconds)
-        const controller = new AbortController();
-        const timeoutId = setTimeout(() => controller.abort(), 30000);
+        // ROOT FIX: Increased timeout for Render services (can take 30-60s to wake up on free tier)
+        // Also add retry logic for better reliability
+        const FETCH_TIMEOUT = 120000; // 2 minutes (Render services can take time to wake up)
+        const MAX_RETRIES = 3;
+        const RETRY_DELAY = 10000; // 10 seconds between retries
         
-        try {
-          const exportResponse = await fetch(`${exportServiceUrl}/export-dashboard`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify(requestBody),
-            signal: controller.signal
-          });
-          clearTimeout(timeoutId);
-          
-          const exportResult = await exportResponse.json().catch(() => null);
-          if (exportResult && exportResult.ok) {
-            console.log(`[Auto-Export] ✅ Completed for session ${effectiveSessionId}`);
-          } else {
-            console.warn(`[Auto-Export] ⚠️ Failed for session ${effectiveSessionId}: ${exportResult?.error || exportResult?.detail || exportResponse?.status || 'Unknown error'}`);
-            if (exportResponse && !exportResponse.ok) {
-              console.warn(`[Auto-Export] HTTP Status: ${exportResponse.status} ${exportResponse.statusText}`);
+        let exportSuccess = false;
+        let lastError = null;
+        
+        for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
+          try {
+            console.log(`[Auto-Export] Attempt ${attempt}/${MAX_RETRIES} to connect to export service...`);
+            
+            const controller = new AbortController();
+            const timeoutId = setTimeout(() => controller.abort(), FETCH_TIMEOUT);
+            
+            try {
+              const exportResponse = await fetch(`${exportServiceUrl}/export-dashboard`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(requestBody),
+                signal: controller.signal
+              });
+              clearTimeout(timeoutId);
+              
+              const exportResult = await exportResponse.json().catch(() => null);
+              if (exportResult && exportResult.ok) {
+                console.log(`[Auto-Export] ✅ Export completed successfully for session ${effectiveSessionId}`);
+                exportSuccess = true;
+                break; // Success - exit retry loop
+              } else {
+                console.warn(`[Auto-Export] ⚠️ Export failed for session ${effectiveSessionId}: ${exportResult?.error || exportResult?.detail || exportResponse?.status || 'Unknown error'}`);
+                if (exportResponse && !exportResponse.ok) {
+                  console.warn(`[Auto-Export] HTTP Status: ${exportResponse.status} ${exportResponse.statusText}`);
+                  
+                  // If it's a 5xx error, retry. If it's 4xx, don't retry (likely config issue)
+                  if (exportResponse.status >= 500 && attempt < MAX_RETRIES) {
+                    console.log(`[Auto-Export] Server error (${exportResponse.status}), will retry in ${RETRY_DELAY/1000}s...`);
+                    await new Promise(resolve => setTimeout(resolve, RETRY_DELAY));
+                    continue;
+                  }
+                }
+                lastError = new Error(exportResult?.error || exportResult?.detail || `HTTP ${exportResponse?.status}`);
+                break; // Don't retry on 4xx errors
+              }
+            } catch (fetchErr) {
+              clearTimeout(timeoutId);
+              lastError = fetchErr;
+              
+              // Detailed error logging
+              if (fetchErr.name === 'AbortError') {
+                console.error(`[Auto-Export] ❌ Timeout (${FETCH_TIMEOUT/1000}s) connecting to ${exportServiceUrl} (attempt ${attempt}/${MAX_RETRIES})`);
+                if (attempt < MAX_RETRIES) {
+                  console.log(`[Auto-Export] ⏳ Retrying in ${RETRY_DELAY/1000}s... (Render service may be waking up)`);
+                  await new Promise(resolve => setTimeout(resolve, RETRY_DELAY));
+                  continue; // Retry
+                }
+              } else if (fetchErr.code === 'ECONNREFUSED') {
+                console.error(`[Auto-Export] ❌ Connection refused to ${exportServiceUrl} (attempt ${attempt}/${MAX_RETRIES})`);
+                console.error(`[Auto-Export] 💡 Service may be sleeping (Render free tier) or URL incorrect`);
+                if (attempt < MAX_RETRIES) {
+                  console.log(`[Auto-Export] ⏳ Retrying in ${RETRY_DELAY/1000}s... (service may be waking up)`);
+                  await new Promise(resolve => setTimeout(resolve, RETRY_DELAY));
+                  continue; // Retry
+                }
+              } else if (fetchErr.code === 'ENOTFOUND' || fetchErr.code === 'EAI_AGAIN') {
+                console.error(`[Auto-Export] ❌ DNS resolution failed for ${exportServiceUrl} (attempt ${attempt}/${MAX_RETRIES})`);
+                if (attempt < MAX_RETRIES) {
+                  console.log(`[Auto-Export] ⏳ Retrying in ${RETRY_DELAY/1000}s...`);
+                  await new Promise(resolve => setTimeout(resolve, RETRY_DELAY));
+                  continue; // Retry
+                }
+              } else if (fetchErr.message && fetchErr.message.includes('fetch failed')) {
+                console.error(`[Auto-Export] ❌ Network error: ${fetchErr.message} (attempt ${attempt}/${MAX_RETRIES})`);
+                console.error(`[Auto-Export] Error code: ${fetchErr.code || 'N/A'}`);
+                if (attempt < MAX_RETRIES) {
+                  console.log(`[Auto-Export] ⏳ Retrying in ${RETRY_DELAY/1000}s...`);
+                  await new Promise(resolve => setTimeout(resolve, RETRY_DELAY));
+                  continue; // Retry
+                }
+                console.error(`[Auto-Export] 💡 Ensure EXPORT_SERVICE_URL is set to the Python service's public URL (e.g., https://your-python-service.onrender.com)`);
+              } else {
+                console.error(`[Auto-Export] ❌ Error: ${fetchErr.message} (attempt ${attempt}/${MAX_RETRIES})`);
+                if (attempt < MAX_RETRIES) {
+                  console.log(`[Auto-Export] ⏳ Retrying in ${RETRY_DELAY/1000}s...`);
+                  await new Promise(resolve => setTimeout(resolve, RETRY_DELAY));
+                  continue; // Retry
+                }
+              }
+            }
+          } catch (retryErr) {
+            console.error(`[Auto-Export] ❌ Retry attempt ${attempt} error: ${retryErr.message}`);
+            lastError = retryErr;
+            if (attempt < MAX_RETRIES) {
+              await new Promise(resolve => setTimeout(resolve, RETRY_DELAY));
             }
           }
-        } catch (fetchErr) {
-          clearTimeout(timeoutId);
-          
-          // Detailed error logging
-          if (fetchErr.name === 'AbortError') {
-            console.error(`[Auto-Export] ❌ Timeout (30s) connecting to ${exportServiceUrl}`);
-          } else if (fetchErr.code === 'ECONNREFUSED') {
-            console.error(`[Auto-Export] ❌ Connection refused to ${exportServiceUrl}. Service may not be running or URL is incorrect.`);
-            console.error(`[Auto-Export] 💡 Check: EXPORT_SERVICE_URL environment variable is set correctly (must be public URL on Render, not localhost)`);
-          } else if (fetchErr.code === 'ENOTFOUND' || fetchErr.code === 'EAI_AGAIN') {
-            console.error(`[Auto-Export] ❌ DNS resolution failed for ${exportServiceUrl}. URL may be incorrect.`);
-          } else if (fetchErr.message && fetchErr.message.includes('fetch failed')) {
-            console.error(`[Auto-Export] ❌ Network error: ${fetchErr.message}`);
-            console.error(`[Auto-Export] Error code: ${fetchErr.code || 'N/A'}, cause: ${fetchErr.cause || 'N/A'}`);
-            console.error(`[Auto-Export] 💡 Ensure EXPORT_SERVICE_URL is set to the Python service's public URL (e.g., https://your-python-service.onrender.com)`);
-          } else {
-            console.error(`[Auto-Export] ❌ Error: ${fetchErr.message}`);
-            console.error(`[Auto-Export] Error details: ${JSON.stringify({ code: fetchErr.code, cause: fetchErr.cause, name: fetchErr.name })}`);
-          }
+        }
+        
+        if (!exportSuccess) {
+          console.error(`[Auto-Export] ❌ Failed after ${MAX_RETRIES} attempts: ${lastError?.message || 'Unknown error'}`);
+          console.error(`[Auto-Export] 💡 Export service may be sleeping. Check: ${exportServiceUrl}/health`);
         }
       } catch (exportErr) {
         console.error(`[Auto-Export] ❌ Unexpected error: ${exportErr.message}`);
@@ -1558,4 +1619,3 @@ app.post('/schedule/stop', (req, res) => {
   scheduleTimer = null;
   res.status(200).json({ ok: true, running: false });
 });
-
