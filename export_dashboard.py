@@ -133,378 +133,160 @@ def get_sheets_service():
         raise ValueError(f"Invalid GOOGLE_CREDENTIALS_JSON: {e}")
 
 
-async def incremental_sync(tab_name: str, excel_path: Path, spreadsheet_id: str, key_col: str = "Candidate ID"):
+async def sync_to_sheets_with_audit(tab_name: str, excel_path: Path, spreadsheet_id: str):
     """
-    Incremental sync: Read Excel, compare with existing Google Sheet data, upload new/changed rows.
+    Sync Excel data to Google Sheets (adds new, updates changed, skips identical).
+    Logs audit only for modified rows (not new ones).
     
-    ROOT FIX: Each file is read with fresh context, explicit file closing, no global state reuse.
-    
-    Returns: {"tab": tab_name, "new": count, "updated": count, "skipped": count, "rows": total_rows}
+    Returns: {"tab": tab_name, "new_rows": count, "updated_rows": count, "skipped": count, "audit_entries": count}
     """
-    # ROOT FIX: Ensure fresh state for this tab - no global variables reused
-    df_new = None
-    file_handle = None
-    
     try:
-        logger.info(f"\n{'='*70}")
-        logger.info(f"📊 Starting incremental sync for '{tab_name}'")
-        logger.info(f"{'='*70}")
+        # Get Google Sheets service
+        service = get_sheets_service()
+        sheets = service.spreadsheets()
         
-        # Step 1: Verify file exists and get metadata
-        if not excel_path.exists():
-            raise FileNotFoundError(f"Excel file not found: {excel_path}")
+        logger.info(f"📊 Starting incremental sync for {tab_name}...")
         
-        # Get file metadata BEFORE opening
-        file_stat = excel_path.stat()
-        file_size = file_stat.st_size
-        file_mtime = file_stat.st_mtime
-        logger.info(f"📁 File: {excel_path.name}")
-        logger.info(f"📦 File size: {file_size} bytes")
-        logger.info(f"🕒 File modified: {datetime.fromtimestamp(file_mtime).isoformat()}")
+        # Read Excel data
+        df_new = pd.read_excel(excel_path, engine="openpyxl").fillna("").astype(str)
         
-        # ROOT FIX: Read Excel file with explicit context management
-        # Using open() context manager ensures file is closed immediately after read
-        logger.info(f"📖 Opening Excel file with fresh context: {excel_path}")
-        
-        # Force garbage collection before reading to clear any cached data
-        import gc
-        gc.collect()
-        
-        # ROOT FIX: Read file with explicit open context - ensures fresh read each time
-        # pandas read_excel will handle the file internally, but we ensure it's a fresh read
+        # Fetch existing sheet data
         try:
-            # Open file explicitly to ensure fresh read (pandas will use it)
-            with open(excel_path, 'rb') as f:
-                # Read entire file into memory first to ensure we have fresh data
-                file_content = f.read()
-                file_content_size = len(file_content)
-                logger.info(f"✅ File read into memory: {file_content_size} bytes")
-                
-                # Close file handle immediately
-                f.close()
-            
-            # ROOT FIX: Now read from memory buffer using BytesIO - completely isolated
-            from io import BytesIO
-            excel_buffer = BytesIO(file_content)
-            
-            # Clear the file_content from memory after creating buffer
-            del file_content
-            gc.collect()
-            
-            # Read from buffer - each call gets fresh data
-            df_new = pd.read_excel(excel_buffer, engine='openpyxl')
-            
-            # Explicitly close the buffer
-            excel_buffer.close()
-            del excel_buffer
-            gc.collect()
-            
-            logger.info(f"✅ Excel file parsed successfully (file handle closed)")
-            
-        except Exception as read_err:
-            logger.error(f"❌ Error reading Excel file: {read_err}")
-            raise
+            sheet_data = (
+                sheets.values()
+                .get(spreadsheetId=spreadsheet_id, range=f"'{tab_name}'!A:Z")
+                .execute()
+                .get("values", [])
+            )
+        except Exception:
+            sheet_data = []
         
-        # ROOT FIX: Verify we got data and log detailed info
-        if df_new is None or df_new.empty:
-            logger.warning(f"⚠️ Excel file for {tab_name} is empty or could not be read")
-            return {"tab": tab_name, "new": 0, "updated": 0, "skipped": 0, "rows": 0, "error": "Excel file is empty"}
-        
-        # Log actual row count and verify uniqueness
-        row_count = len(df_new)
-        col_count = len(df_new.columns)
-        logger.info(f"📊 Loaded {row_count} rows, {col_count} columns from Excel file")
-        
-        # ROOT FIX: Per-tab verification log BEFORE uploading
-        logger.info(f"\n{'='*70}")
-        logger.info(f"🔍 PER-TAB VERIFICATION FOR '{tab_name}'")
-        logger.info(f"{'='*70}")
-        logger.info(f"📁 Source file: {excel_path.name}")
-        logger.info(f"📦 File size: {file_size} bytes")
-        logger.info(f"📊 Row count: {row_count}")
-        logger.info(f"📋 Column count: {col_count}")
-        
-        # Log column names to verify structure
-        if col_count > 0:
-            logger.info(f"📋 Columns: {list(df_new.columns[:10])}" + ("..." if col_count > 10 else ""))
-        
-        # Log sample data from first and last rows to verify content uniqueness
-        if row_count > 0:
-            # First row sample
-            first_row = df_new.iloc[0]
-            first_row_data = {}
-            sample_cols = list(df_new.columns)[:5]  # First 5 columns
-            for col in sample_cols:
-                val = first_row.get(col, '')
-                first_row_data[col] = str(val)[:50]  # First 50 chars
-            logger.info(f"🔍 First row sample: {first_row_data}")
-            
-            # Last row sample (if multiple rows)
-            if row_count > 1:
-                last_row = df_new.iloc[-1]
-                last_row_data = {}
-                for col in sample_cols:
-                    val = last_row.get(col, '')
-                    last_row_data[col] = str(val)[:50]
-                logger.info(f"🔍 Last row sample: {last_row_data}")
-            
-            # Check for key column
-            if key_col in df_new.columns:
-                unique_keys = df_new[key_col].nunique()
-                logger.info(f"🔑 Key column '{key_col}': {unique_keys} unique values")
-            else:
-                logger.warning(f"⚠️ Key column '{key_col}' not found in data")
-        
-        logger.info(f"{'='*70}\n")
-        
-        # Clean control characters from Excel data immediately after reading
-        def clean_excel_value(val):
-            if pd.isna(val):
-                return val
-            val_str = str(val)
-            # Remove invalid JSON control characters (characters below 32 except newline, carriage return, tab)
-            cleaned = ''.join(char if ord(char) >= 32 or char in '\n\r\t' else ' ' for char in val_str)
-            return cleaned
-        
-        # ROOT FIX: Create fresh copy for cleaning to avoid modifying original
-        df_working = df_new.copy()
-        
-        # Clean all object (string) columns
-        for col in df_working.select_dtypes(include=['object']).columns:
-            df_working[col] = df_working[col].apply(clean_excel_value)
-        
-        # Clean column names
-        df_working.columns = [clean_excel_value(str(col)) for col in df_working.columns]
-        
-        # Add timestamp column
-        sync_timestamp = datetime.now().isoformat()
-        if "LastSyncedAt" not in df_working.columns:
-            df_working["LastSyncedAt"] = sync_timestamp
+        if sheet_data:
+            headers = sheet_data[0]
+            df_existing = pd.DataFrame(sheet_data[1:], columns=headers)
         else:
-            df_working["LastSyncedAt"] = sync_timestamp
+            df_existing = pd.DataFrame(columns=df_new.columns)
         
-        # ROOT FIX: Clear original df_new and use cleaned version
-        del df_new
-        df_new = df_working
-        del df_working
-        gc.collect()
+        # Align columns safely
+        df_new = df_new.reindex(columns=df_existing.columns, fill_value="") if not df_existing.empty else df_new
         
-        logger.info(f"✅ Loaded {len(df_new)} rows from Excel (cleaned control characters)")
+        # Normalize (remove type diff, trim spaces)
+        df_existing = df_existing.fillna("").astype(str).apply(lambda x: x.str.strip())
+        df_new = df_new.fillna("").astype(str).apply(lambda x: x.str.strip())
         
-        # Step 2: Read existing data from Google Sheet (if sheet exists)
-        try:
-            service = get_sheets_service()
-        except Exception as creds_err:
-            logger.error(f"❌ Failed to initialize Google Sheets service: {creds_err}")
-            logger.error(f"❌ Error type: {type(creds_err).__name__}")
-            import traceback
-            logger.error(f"❌ Traceback: {traceback.format_exc()}")
-            raise Exception(f"Google Sheets credentials error: {creds_err}")
+        # Identify unique key column
+        UNIQUE_KEY = "Candidate ID" if "Candidate ID" in df_new.columns else df_new.columns[0]
         
-        sheet_name = tab_name  # Use tab name as sheet name
+        # Merge datasets to detect changes
+        merged = pd.merge(
+            df_existing, df_new,
+            on=UNIQUE_KEY,
+            how="outer",
+            indicator=True,
+            suffixes=("_old", "_new")
+        )
         
-        try:
-            # Check if sheet exists
-            spreadsheet = service.spreadsheets().get(spreadsheetId=spreadsheet_id).execute()
-            sheet_exists = any(s.get('properties', {}).get('title') == sheet_name for s in spreadsheet.get('sheets', []))
+        new_rows = merged[merged["_merge"] == "right_only"][df_new.columns]
+        updated_rows = []
+        audit_log_entries = []
+        
+        # Detect changes for existing rows
+        for _, row in merged[merged["_merge"] == "both"].iterrows():
+            changed_cols = []
+            for col in df_existing.columns:
+                if col == UNIQUE_KEY:
+                    continue
+                old_val = str(row.get(f"{col}_old", "")).strip()
+                new_val = str(row.get(f"{col}_new", "")).strip()
+                if old_val != new_val:
+                    changed_cols.append((col, old_val, new_val))
             
-            if sheet_exists and key_col in df_new.columns:
-                # Read existing data
-                logger.info(f"📥 Reading existing data from sheet '{sheet_name}'...")
-                try:
-                    result = service.spreadsheets().values().get(
+            if changed_cols:
+                updated_row = {col: row.get(f"{col}_new", "") for col in df_existing.columns}
+                updated_rows.append(updated_row)
+                
+                # Create detailed audit log entries
+                for c, o, n in changed_cols:
+                    audit_log_entries.append([
+                        datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                        tab_name,
+                        row[UNIQUE_KEY],
+                        "UPDATED",
+                        c,
+                        o,
+                        n
+                    ])
+                
+                change_details = ", ".join([f"{c}: '{o}' → '{n}'" for c, o, n in changed_cols])
+                logger.info(f"✏️ {tab_name} | {UNIQUE_KEY}={row[UNIQUE_KEY]} | {change_details}")
+        
+        # ➕ Add only new rows (no audit log for these)
+        if not new_rows.empty:
+            sheets.values().append(
+                spreadsheetId=spreadsheet_id,
+                range=f"'{tab_name}'!A1",
+                valueInputOption="RAW",
+                insertDataOption="INSERT_ROWS",
+                body={"values": new_rows.values.tolist()},
+            ).execute()
+            logger.info(f"➕ Added {len(new_rows)} new rows to '{tab_name}'")
+        
+        # ✏️ Update modified rows
+        if updated_rows:
+            df_updates = pd.DataFrame(updated_rows)
+            for _, row in df_updates.iterrows():
+                row_index = df_existing[df_existing[UNIQUE_KEY] == row[UNIQUE_KEY]].index
+                if not row_index.empty:
+                    sheets.values().update(
                         spreadsheetId=spreadsheet_id,
-                        range=f"{sheet_name}!A:ZZ"
+                        range=f"'{tab_name}'!A{row_index[0] + 2}",
+                        valueInputOption="RAW",
+                        body={"values": [row.tolist()]},
                     ).execute()
-                    values = result.get('values', [])
-                    
-                    if values and len(values) > 1:
-                        # Convert to DataFrame
-                        # Clean control characters from headers and rows
-                        def clean_cell(val):
-                            if val is None:
-                                return ''
-                            val_str = str(val)
-                            # Remove invalid JSON control characters (keep only printable chars and newlines/tabs)
-                            return ''.join(char if ord(char) >= 32 or char in '\n\r\t' else ' ' for char in val_str)
-                        
-                        headers = [clean_cell(h) for h in values[0]]
-                        rows = [[clean_cell(cell) for cell in row] for row in values[1:]]
-                        df_existing = pd.DataFrame(rows, columns=headers)
-                        
-                        logger.info(f"📊 Found {len(df_existing)} existing rows in sheet")
-                        
-                        # Merge: identify new, updated, and unchanged rows
-                        if key_col in df_existing.columns and key_col in df_new.columns:
-                            # Merge on key column
-                            existing_keys = set(df_existing[key_col].astype(str))
-                            new_keys = set(df_new[key_col].astype(str))
-                            updated_keys = existing_keys & new_keys
-                            
-                            # For simplicity, mark all existing keys as updated if present in new data
-                            updated_count = len(updated_keys)
-                            new_count = len(new_keys - existing_keys)
-                            skipped_count = len(existing_keys - new_keys)  # Rows removed from Excel (keep in sheet)
-                            
-                            # Final DataFrame: new + all updated existing rows + unchanged existing rows
-                            df_final = pd.concat([
-                                df_new[df_new[key_col].astype(str).isin(new_keys | updated_keys)],  # New + Updated
-                                df_existing[df_existing[key_col].astype(str).isin(existing_keys - new_keys)]  # Unchanged (keep)
-                            ], ignore_index=True)
-                            
-                            logger.info(f"📈 Sync stats: {new_count} new, {updated_count} updated, {skipped_count} unchanged")
-                        else:
-                            # No key column match, just append new data
-                            df_final = pd.concat([df_existing, df_new], ignore_index=True)
-                            new_count = len(df_new)
-                            updated_count = 0
-                            skipped_count = len(df_existing)
-                            logger.info(f"📈 No key column match - appending {new_count} new rows")
-                    else:
-                        # Empty sheet, use new data
-                        df_final = df_new
-                        new_count = len(df_new)
-                        updated_count = 0
-                        skipped_count = 0
-                        logger.info(f"📊 Sheet is empty - uploading all {new_count} rows as new")
-                except Exception as read_err:
-                    logger.warning(f"⚠️ Could not read existing sheet (treating as empty): {read_err}")
-                    df_final = df_new
-                    new_count = len(df_new)
-                    updated_count = 0
-                    skipped_count = 0
-            else:
-                # Sheet doesn't exist or no key column, upload all new data
-                df_final = df_new
-                new_count = len(df_new)
-                updated_count = 0
-                skipped_count = 0
-                logger.info(f"📊 Sheet '{sheet_name}' doesn't exist - uploading all {new_count} rows as new")
-        except Exception as read_err:
-            logger.warning(f"⚠️ Error reading existing sheet (uploading all as new): {read_err}")
-            df_final = df_new
-            new_count = len(df_new)
-            updated_count = 0
-            skipped_count = 0
+            logger.info(f"✅ Updated {len(updated_rows)} modified rows in '{tab_name}'")
         
-        # Step 3: Save snapshot
-        snapshot_path = SNAPSHOTS_DIR / f"{tab_name}.json"
-        try:
-            # Clean DataFrame before saving to JSON (remove/replace control characters)
-            df_clean = df_final.copy()
-            # Replace control characters (newlines, tabs, etc.) in string columns
-            for col in df_clean.select_dtypes(include=['object']).columns:
-                df_clean[col] = df_clean[col].astype(str).replace([r'\n', r'\r', r'\t'], [' ', ' ', ' '], regex=True)
-                # Remove any remaining control characters
-                df_clean[col] = df_clean[col].apply(lambda x: ''.join(char for char in str(x) if ord(char) >= 32 or char in '\n\r\t') if pd.notna(x) else x)
-            
-            df_clean.to_json(snapshot_path, orient='records', date_format='iso', force_ascii=True)
-            logger.info(f"💾 Saved snapshot to {snapshot_path}")
-        except Exception as snapshot_err:
-            logger.warning(f"⚠️ Could not save snapshot: {snapshot_err}")
-            # Don't fail the whole sync if snapshot fails
-        
-        # Step 4: Upload to Google Sheets
-        logger.info(f"📤 Uploading {len(df_final)} rows to sheet '{sheet_name}'...")
-        
-        # Ensure sheet exists
-        try:
-            spreadsheet = service.spreadsheets().get(spreadsheetId=spreadsheet_id).execute()
-            sheet_exists = any(s.get('properties', {}).get('title') == sheet_name for s in spreadsheet.get('sheets', []))
-            
-            if not sheet_exists:
-                logger.info(f"📋 Creating new sheet '{sheet_name}'...")
-                request_body = {
-                    'requests': [{
-                        'addSheet': {
-                            'properties': {
-                                'title': sheet_name
-                            }
-                        }
-                    }]
-                }
+        # 🧾 Append audit logs (only for modified rows)
+        if audit_log_entries:
+            try:
+                sheets.values().append(
+                    spreadsheetId=spreadsheet_id,
+                    range="'Audit Log'!A1",
+                    valueInputOption="RAW",
+                    insertDataOption="INSERT_ROWS",
+                    body={"values": audit_log_entries},
+                ).execute()
+                logger.info(f"🕒 Logged {len(audit_log_entries)} change events to 'Audit Log'")
+            except Exception:
+                # Create "Audit Log" sheet if not found
+                logger.warning("⚠️ 'Audit Log' sheet missing — creating new one.")
                 service.spreadsheets().batchUpdate(
                     spreadsheetId=spreadsheet_id,
-                    body=request_body
+                    body={"requests": [{"addSheet": {"properties": {"title": "Audit Log"}}}]}
                 ).execute()
-                logger.info(f"✅ Created sheet '{sheet_name}'")
-        except Exception as create_err:
-            logger.warning(f"⚠️ Could not create sheet (may already exist): {create_err}")
+                headers = [["Timestamp", "Tab Name", "Candidate ID", "Action", "Column", "Old Value", "New Value"]]
+                sheets.values().update(
+                    spreadsheetId=spreadsheet_id,
+                    range="'Audit Log'!A1",
+                    valueInputOption="RAW",
+                    body={"values": headers + audit_log_entries},
+                ).execute()
+                logger.info("✅ Created and populated new 'Audit Log' sheet")
         
-        # Convert DataFrame to list of lists for Google Sheets API
-        # Clean control characters from values to prevent JSON errors
-        def clean_value(val):
-            if pd.isna(val):
-                return ''
-            val_str = str(val)
-            # Replace control characters (keep newlines and tabs for readability in sheets)
-            # But ensure no invalid JSON control characters
-            val_str = ''.join(char if ord(char) >= 32 or char in '\n\r\t' else ' ' for char in val_str)
-            return val_str
+        skipped = len(df_existing) - len(updated_rows) - len(new_rows) if not df_existing.empty else 0
+        logger.info(f"🟢 Skipped {max(skipped, 0)} identical rows in '{tab_name}'")
+        logger.info(f"✅ Completed sync for {tab_name}")
         
-        # Clean column names
-        clean_columns = [clean_value(col) for col in df_final.columns.tolist()]
-        
-        # Clean all values
-        clean_values = []
-        for row in df_final.fillna('').values:
-            clean_values.append([clean_value(val) for val in row])
-        
-        values = [clean_columns] + clean_values
-        
-        # Clear existing data and write new data
-        range_name = f"{sheet_name}!A1"
-        service.spreadsheets().values().clear(
-            spreadsheetId=spreadsheet_id,
-            range=f"{sheet_name}!A:ZZ"
-        ).execute()
-        
-        service.spreadsheets().values().update(
-            spreadsheetId=spreadsheet_id,
-            range=range_name,
-            valueInputOption="RAW",
-            body={"values": values}
-        ).execute()
-        
-        logger.info(f"✅ Successfully uploaded {len(df_final)} rows to sheet '{sheet_name}'")
-        
-        # ROOT FIX: Explicit cleanup before returning
-        result = {
+        return {
             "tab": tab_name,
-            "new": new_count,
-            "updated": updated_count,
-            "skipped": skipped_count,
-            "rows": len(df_final),
-            "sheet": sheet_name,
-            "file_size_bytes": file_size
+            "new_rows": len(new_rows),
+            "updated_rows": len(updated_rows),
+            "skipped": max(skipped, 0),
+            "audit_entries": len(audit_log_entries)
         }
         
-        # Clear all dataframes from memory
-        del df_final
-        if 'df_new' in locals():
-            del df_new
-        if 'df_existing' in locals():
-            del df_existing
-        gc.collect()
-        
-        logger.info(f"✅ Completed sync for '{tab_name}' (memory cleared)")
-        return result
-        
     except Exception as e:
-        logger.error(f"❌ Incremental sync error for {tab_name}: {e}")
-        import traceback
-        logger.error(f"❌ Traceback: {traceback.format_exc()}")
-        
-        # ROOT FIX: Ensure cleanup on error
-        if 'df_new' in locals() and df_new is not None:
-            del df_new
-        if 'file_handle' in locals() and file_handle is not None:
-            try:
-                file_handle.close()
-            except:
-                pass
-        gc.collect()
-        raise
+        logger.error(f"❌ Sync failed for {tab_name}: {e}", exc_info=True)
+        return {"tab": tab_name, "error": str(e)}
 
 
 async def sync_all_tabs_to_sheets(download_dir: Path, spreadsheet_id: str):
@@ -536,7 +318,7 @@ async def sync_all_tabs_to_sheets(download_dir: Path, spreadsheet_id: str):
                 continue
             
             # ROOT FIX: Process each tab independently with explicit cleanup between tabs
-            result = await incremental_sync(tab, excel_path, spreadsheet_id)
+            result = await sync_to_sheets_with_audit(tab, excel_path, spreadsheet_id)
             tab_results.append(result)
             
             # ROOT FIX: Explicit cleanup between tabs
@@ -546,18 +328,13 @@ async def sync_all_tabs_to_sheets(download_dir: Path, spreadsheet_id: str):
             # Small delay between tabs to ensure file system is ready
             if idx < len(TABS):
                 await asyncio.sleep(1)
-            
+                
         except Exception as e:
             logger.error(f"❌ Error syncing {tab} to Sheets: {e}")
-            import traceback
-            logger.error(f"❌ Traceback: {traceback.format_exc()}")
             tab_results.append({"tab": tab, "status": "error", "error": str(e)})
-            
-            # ROOT FIX: Cleanup on error
-            gc.collect()
     
     logger.info(f"\n{'='*70}")
-    logger.info(f"✅ Completed sync for all {len(TABS)} tabs")
+    logger.info(f"✅ Google Sheets upload completed: {len(tab_results)} tab(s) processed")
     logger.info(f"{'='*70}\n")
     
     return tab_results
@@ -713,51 +490,12 @@ async def click_advance_search(page: Page):
     raise Exception(f"Advance Search not clickable after all attempts. URL: {current_url}")
 
 
-async def export_tab(page: Page, tab_name: str, download_dir: Path):
+async def export_tab(page: Page, tab_name: str, download_dir: Path, is_first_tab: bool = False):
+    # NOTE: is_first_tab parameter kept for backward compatibility but all tabs are clicked now
     logger.info(f"📊 Exporting tab: {tab_name}")
     
-    # ROOT FIX: Capture initial data state BEFORE clicking tab
-    # This must be done BEFORE clicking to compare with after-click state
-    logger.info(f"📊 Capturing current data state before clicking tab '{tab_name}'...")
-    initial_data_hash = None
-    try:
-        # Get hash of DATA ROWS only (skip header row)
-        initial_data_hash = await page.evaluate("""
-            () => {
-                const tables = Array.from(document.querySelectorAll('table, [role="grid"], .k-grid, [data-role="grid"]'));
-                if (tables.length > 0) {
-                    const table = tables[0];
-                    // Get tbody rows OR skip first row if it's likely a header
-                    const allRows = Array.from(table.querySelectorAll('tbody tr, tr'));
-                    if (allRows.length > 1) {
-                        // Skip first row (header) and get next 3-5 data rows
-                        const dataRows = allRows.slice(1, 6); // Rows 2-6 (skip header)
-                        if (dataRows.length > 0) {
-                            // Get row data: extract cell values (not just text - more specific)
-                            const rowData = dataRows.map(row => {
-                                const cells = Array.from(row.querySelectorAll('td, th'));
-                                // Get first few cells' values for hash
-                                return cells.slice(0, 5).map(c => c.textContent?.trim() || '').filter(Boolean).join(',');
-                            }).filter(r => r.length > 0);
-                            return rowData.join('|');
-                        }
-                    } else if (allRows.length === 1) {
-                        // Only one row, might be header-only, return it
-                        return allRows[0].textContent?.trim() || null;
-                    }
-                }
-                return null;
-            }
-        """)
-        if initial_data_hash:
-            logger.info(f"📊 Captured initial data hash (data rows, skip header): {initial_data_hash[:100]}...")
-        else:
-            logger.warning(f"⚠️ Could not capture initial data hash - may be empty table")
-    except Exception as hash_err:
-        logger.debug(f"Could not capture initial data hash: {hash_err}")
-    
-    # ROOT FIX: Try multiple strategies to click tab - ensure it actually switches
-    logger.info(f"🖱️ Clicking tab: '{tab_name}'")
+    # USER REQUEST: For ALL tabs (including first), click to confirm selection
+    logger.info(f"🖱️ Clicking tab to confirm selection: '{tab_name}'")
     
     tab_selectors = [
         f'text="{tab_name}"',
@@ -824,147 +562,10 @@ async def export_tab(page: Page, tab_name: str, download_dir: Path):
         await page.screenshot(path=screenshot_path, full_page=True)
         raise Exception(f"Could not click tab: {tab_name} (screenshot: {screenshot_path})")
     
-    # Small wait after click to let tab switch start
-    await asyncio.sleep(2)
-    
-    # ROOT FIX: Wait for tab content to actually CHANGE (not just tab activation)
-    logger.info(f"⏳ Waiting for tab '{tab_name}' to load and data to change...")
-    
-    # Wait for tab switch
-    await asyncio.sleep(5)  # Initial wait for tab switch
-    
-    # ROOT FIX: Verify tab is active AND data has actually changed
-    max_verification_attempts = 15
-    tab_verified = False
-    data_changed = False
-    
-    for attempt in range(max_verification_attempts):
-        try:
-            # Check if tab is active/selected
-            active_found = False
-            active_indicators = [
-                f'text="{tab_name}" >> ..active',
-                f'text="{tab_name}" >> ..selected',
-                f'a:has-text("{tab_name}") >> ..active',
-                f'button:has-text("{tab_name}") >> ..active',
-                f'li:has-text("{tab_name}") >> ..active',
-                f'[data-tab*="{tab_name}"][class*="active"]',
-                f'[aria-label*="{tab_name}"][aria-selected="true"]',
-            ]
-            
-            for indicator in active_indicators:
-                try:
-                    element = await page.query_selector(indicator)
-                    if element:
-                        active_found = True
-                        break
-                except:
-                    continue
-            
-            # CRITICAL: Verify data has actually changed (skip header row)
-            if initial_data_hash:
-                try:
-                    current_data_hash = await page.evaluate("""
-                        () => {
-                            const tables = Array.from(document.querySelectorAll('table, [role="grid"], .k-grid, [data-role="grid"]'));
-                            if (tables.length > 0) {
-                                const table = tables[0];
-                                const allRows = Array.from(table.querySelectorAll('tbody tr, tr'));
-                                if (allRows.length > 1) {
-                                    // Skip first row (header) and get data rows only
-                                    const dataRows = allRows.slice(1, 6); // Rows 2-6 (skip header)
-                                    if (dataRows.length > 0) {
-                                        const rowData = dataRows.map(row => {
-                                            const cells = Array.from(row.querySelectorAll('td, th'));
-                                            return cells.slice(0, 5).map(c => c.textContent?.trim() || '').filter(Boolean).join(',');
-                                        }).filter(r => r.length > 0);
-                                        return rowData.join('|');
-                                    }
-                                } else if (allRows.length === 1) {
-                                    return allRows[0].textContent?.trim() || null;
-                                }
-                            }
-                            return null;
-                        }
-                    """)
-                    
-                    if current_data_hash:
-                        # Compare hashes (normalize in Python, not JavaScript)
-                        import re
-                        initial_normalized = re.sub(r'\s+', '', initial_data_hash).lower()
-                        current_normalized = re.sub(r'\s+', '', current_data_hash).lower()
-                        
-                        if current_normalized != initial_normalized:
-                            data_changed = True
-                            logger.info(f"✅ Data changed! Initial: {initial_data_hash[:50]}... → New: {current_data_hash[:50]}...")
-                            logger.info(f"✅ Tab '{tab_name}' is active AND data has changed (attempt {attempt+1})")
-                            tab_verified = True
-                            break
-                        else:
-                            logger.debug(f"⏳ Data not changed yet (attempt {attempt+1}), waiting... (hash: {current_data_hash[:50]}...)")
-                    else:
-                        logger.debug(f"⏳ No table data found yet (attempt {attempt+1}), waiting...")
-                except Exception as data_err:
-                    logger.debug(f"Data verification error: {data_err}")
-            
-            # If we can't verify data change, at least verify tab is active
-            if active_found and not initial_data_hash:
-                tab_verified = True
-                logger.info(f"✅ Tab '{tab_name}' is active (attempt {attempt+1})")
-                break
-            
-            await asyncio.sleep(2)  # Wait 2 seconds before next verification attempt
-            
-        except Exception as verify_err:
-            logger.debug(f"Verification attempt {attempt+1} failed: {verify_err}")
-            await asyncio.sleep(2)
-    
-    if not tab_verified:
-        logger.warning(f"⚠️ Could not verify tab '{tab_name}' switched properly")
-        if initial_data_hash and not data_changed:
-            logger.error(f"❌ CRITICAL: Data did not change after clicking tab '{tab_name}'! This will export wrong data!")
-            # Take screenshot for debugging
-            screenshot_path = f"/tmp/tab_not_changed_{tab_name.replace(' ', '_')}_{datetime.now().strftime('%H%M%S')}.png"
-            await page.screenshot(path=screenshot_path, full_page=True)
-            logger.error(f"📸 Screenshot saved: {screenshot_path}")
-            
-            # ROOT FIX: If data didn't change and we have initial hash, fail the export
-            # This prevents exporting duplicate data
-            raise Exception(f"CRITICAL: Tab '{tab_name}' did not switch - data unchanged. Initial hash: {initial_data_hash[:50]}... Refusing to export duplicate data.")
-    else:
-        logger.info(f"✅ Tab '{tab_name}' verified - tab active and data changed")
-    
-    # Additional wait for full content load after verification
-    logger.info(f"⏳ Final wait for tab '{tab_name}' content to fully load...")
-    await wait_full_load(page, 15, f"tab {tab_name}")
-    
-    # USER REQUEST: Additional 40 seconds wait specifically for tab to fully load before export
-    logger.info(f"⏳ Waiting 40 seconds for tab '{tab_name}' to fully load before export...")
-    await asyncio.sleep(40)
-    logger.info(f"✅ 40 second wait completed - ready to export '{tab_name}'")
-    
-    # ROOT FIX: Final verification - capture actual data that will be exported
-    try:
-        final_data_sample = await page.evaluate("""
-            () => {
-                const tables = Array.from(document.querySelectorAll('table, [role="grid"], .k-grid, [data-role="grid"]'));
-                if (tables.length > 0) {
-                    const table = tables[0];
-                    const rows = Array.from(table.querySelectorAll('tbody tr, tr'));
-                    if (rows.length > 0) {
-                        // Get first row's first few cells
-                        const firstRow = rows[0];
-                        const cells = Array.from(firstRow.querySelectorAll('td, th'));
-                        return cells.slice(0, 5).map(c => c.textContent?.trim()).filter(Boolean);
-                    }
-                }
-                return [];
-            }
-        """)
-        if final_data_sample:
-            logger.info(f"🔍 Final data sample (first row, first 5 cells): {final_data_sample}")
-    except Exception as sample_err:
-        logger.debug(f"Could not capture final data sample: {sample_err}")
+    # USER REQUEST: Wait 50 seconds for page to load after clicking tab
+    logger.info(f"⏳ Waiting 50 seconds for tab '{tab_name}' to load after confirmation...")
+    await asyncio.sleep(50)
+    logger.info(f"✅ Tab '{tab_name}' loaded after confirmation")
 
     # Step 3: Click "Export to excel" button
     # CRITICAL: Export button appears AFTER Advance search is clicked and tab is selected
@@ -1110,6 +711,11 @@ async def export_tab(page: Page, tab_name: str, download_dir: Path):
         raise Exception(f"File missing or empty for {tab_name}")
 
     await asyncio.sleep(1)
+    
+    # USER REQUEST: Wait 30 seconds after export before moving to next tab
+    logger.info(f"⏳ Waiting 30 seconds after export before moving to next tab...")
+    await asyncio.sleep(30)
+    
     final_file_size = file_path.stat().st_size
     logger.info(f"✅ Step 4: Export completed for {tab_name} ({final_file_size} bytes)")
     logger.info(f"✅ ✅ Tab '{tab_name}' export workflow finished successfully")
@@ -1117,36 +723,41 @@ async def export_tab(page: Page, tab_name: str, download_dir: Path):
 
 
 async def perform_logout(page: Page):
-    """Universal logout logic with correct dropdown selectors"""
+    """Universal logout logic - click 'Welcome Sukrutha CR' text, then logout"""
     try:
-        logger.info("🔒 Attempting logout via top-right dropdown...")
-        await asyncio.sleep(5)  # allow dashboard JS to finish rendering
+        logger.info("🔒 Attempting logout...")
+        await asyncio.sleep(3)  # allow dashboard JS to finish rendering
         
-        # Correct selectors for Kendo UI menu dropdown
-        selectors_dropdown = [
-            ".k-menu-expand-arrow",
-            "span.k-menu-expand-arrow",
-            "span.k-menu-expand-arrow-icon",
+        # USER REQUEST: Click "Welcome Sukrutha CR" (the text, not dropdown arrow)
+        # Then click logout from the dropdown that appears
+        logger.info("🔍 Looking for 'Welcome Sukrutha CR' to click...")
+        
+        welcome_selectors = [
+            "text='Welcome Sukrutha CR'",
+            "text=/Welcome.*Sukrutha CR/i",
+            "*:has-text('Welcome Sukrutha CR')",
             "text='Welcome'",
-            "text='Sukrutha CR'"
+            "*:has-text('Sukrutha CR')"
         ]
         
-        clicked = False
+        welcome_clicked = False
         for attempt in range(3):
-            for sel in selectors_dropdown:
+            for sel in welcome_selectors:
                 try:
-                    await page.wait_for_selector(sel, timeout=8000)
-                    await page.locator(sel).first.click(force=True)
-                    logger.info(f"✅ Profile dropdown opened via selector: {sel}")
-                    clicked = True
-                    break
+                    element = await page.wait_for_selector(sel, timeout=8000, state="visible")
+                    if element:
+                        await element.click(force=True)
+                        logger.info(f"✅ Clicked 'Welcome Sukrutha CR' via selector: {sel}")
+                        welcome_clicked = True
+                        await asyncio.sleep(2)  # Wait for dropdown to appear
+                        break
                 except Exception as e:
-                    logger.warning(f"Retrying click for Profile_dropdown ({attempt+1}/3): {e}")
-                    await asyncio.sleep(3)
-            if clicked:
+                    logger.debug(f"Welcome selector {sel} failed: {e}")
+                    continue
+            if welcome_clicked:
                 break
         
-        if not clicked:
+        if not welcome_clicked:
             screenshot = f"/tmp/Profile_dropdown_fail_{datetime.now().strftime('%H%M%S')}.png"
             await page.screenshot(path=screenshot, full_page=True)
             logger.error(f"Logout failed: Profile_dropdown not clickable after retries (screenshot: {screenshot})")
@@ -1493,12 +1104,10 @@ async def export_dashboard(session_id: str, spreadsheet_id: str, storage_state: 
                     logger.info(f"\n{'='*70}")
                     logger.info(f"🔄 Processing tab {idx}/{len(TABS)}: {tab}")
                     logger.info(f"{'='*70}")
-                    result = await export_tab(page, tab, download_dir)
+                    # USER REQUEST: Click all tabs (including first) - no special handling needed
+                    result = await export_tab(page, tab, download_dir, is_first_tab=False)
                     results.append(result)
-                    # Wait between tabs to ensure system is ready for next export
-                    if idx < len(TABS):
-                        logger.info(f"⏸️ Waiting 25s before processing next tab...")
-                        await asyncio.sleep(25)
+                    # Note: Already waiting 30 seconds after each export inside export_tab()
                 except Exception as e:
                     logger.error(f"❌ Error exporting tab '{tab}': {e}")
                     await page.screenshot(path=f"/tmp/{tab}_fail_{datetime.now().strftime('%H%M%S')}.png")
