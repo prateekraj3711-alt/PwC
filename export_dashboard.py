@@ -28,7 +28,7 @@ SNAPSHOTS_DIR = TMP_DIR / "snapshots"
 SNAPSHOTS_DIR.mkdir(parents=True, exist_ok=True)
 SESSION_PATH.mkdir(parents=True, exist_ok=True)
 
-EXPORT_TIMEOUT = 240
+EXPORT_TIMEOUT = 240000  # 4 minutes in milliseconds (240,000 ms)
 TABS = [
     "Today's allocated",
     "Not started",
@@ -716,6 +716,46 @@ async def click_advance_search(page: Page):
 async def export_tab(page: Page, tab_name: str, download_dir: Path):
     logger.info(f"📊 Exporting tab: {tab_name}")
     
+    # ROOT FIX: Capture initial data state BEFORE clicking tab
+    # This must be done BEFORE clicking to compare with after-click state
+    logger.info(f"📊 Capturing current data state before clicking tab '{tab_name}'...")
+    initial_data_hash = None
+    try:
+        # Get hash of DATA ROWS only (skip header row)
+        initial_data_hash = await page.evaluate("""
+            () => {
+                const tables = Array.from(document.querySelectorAll('table, [role="grid"], .k-grid, [data-role="grid"]'));
+                if (tables.length > 0) {
+                    const table = tables[0];
+                    // Get tbody rows OR skip first row if it's likely a header
+                    const allRows = Array.from(table.querySelectorAll('tbody tr, tr'));
+                    if (allRows.length > 1) {
+                        // Skip first row (header) and get next 3-5 data rows
+                        const dataRows = allRows.slice(1, 6); // Rows 2-6 (skip header)
+                        if (dataRows.length > 0) {
+                            // Get row data: extract cell values (not just text - more specific)
+                            const rowData = dataRows.map(row => {
+                                const cells = Array.from(row.querySelectorAll('td, th'));
+                                // Get first few cells' values for hash
+                                return cells.slice(0, 5).map(c => c.textContent?.trim() || '').filter(Boolean).join(',');
+                            }).filter(r => r.length > 0);
+                            return rowData.join('|');
+                        }
+                    } else if (allRows.length === 1) {
+                        // Only one row, might be header-only, return it
+                        return allRows[0].textContent?.trim() || null;
+                    }
+                }
+                return null;
+            }
+        """)
+        if initial_data_hash:
+            logger.info(f"📊 Captured initial data hash (data rows, skip header): {initial_data_hash[:100]}...")
+        else:
+            logger.warning(f"⚠️ Could not capture initial data hash - may be empty table")
+    except Exception as hash_err:
+        logger.debug(f"Could not capture initial data hash: {hash_err}")
+    
     # ROOT FIX: Try multiple strategies to click tab - ensure it actually switches
     logger.info(f"🖱️ Clicking tab: '{tab_name}'")
     
@@ -790,30 +830,6 @@ async def export_tab(page: Page, tab_name: str, download_dir: Path):
     # ROOT FIX: Wait for tab content to actually CHANGE (not just tab activation)
     logger.info(f"⏳ Waiting for tab '{tab_name}' to load and data to change...")
     
-    # Capture initial data state BEFORE tab click (if available) to compare later
-    initial_data_hash = None
-    try:
-        # Try to get a hash of current table/grid data to compare
-        initial_data_hash = await page.evaluate("""
-            () => {
-                // Try to find table or grid and get a hash of its content
-                const tables = Array.from(document.querySelectorAll('table, [role="grid"], .k-grid, [data-role="grid"]'));
-                if (tables.length > 0) {
-                    const table = tables[0];
-                    const rows = Array.from(table.querySelectorAll('tbody tr, tr'));
-                    if (rows.length > 0) {
-                        // Get first few rows' text content as hash
-                        return rows.slice(0, 3).map(r => r.textContent?.trim()).filter(Boolean).join('|');
-                    }
-                }
-                return null;
-            }
-        """)
-        if initial_data_hash:
-            logger.info(f"📊 Captured initial data hash (first 3 rows): {initial_data_hash[:100]}...")
-    except Exception as hash_err:
-        logger.debug(f"Could not capture initial data hash: {hash_err}")
-    
     # Wait for tab switch
     await asyncio.sleep(5)  # Initial wait for tab switch
     
@@ -845,7 +861,7 @@ async def export_tab(page: Page, tab_name: str, download_dir: Path):
                 except:
                     continue
             
-            # CRITICAL: Verify data has actually changed
+            # CRITICAL: Verify data has actually changed (skip header row)
             if initial_data_hash:
                 try:
                     current_data_hash = await page.evaluate("""
@@ -853,23 +869,39 @@ async def export_tab(page: Page, tab_name: str, download_dir: Path):
                             const tables = Array.from(document.querySelectorAll('table, [role="grid"], .k-grid, [data-role="grid"]'));
                             if (tables.length > 0) {
                                 const table = tables[0];
-                                const rows = Array.from(table.querySelectorAll('tbody tr, tr'));
-                                if (rows.length > 0) {
-                                    return rows.slice(0, 3).map(r => r.textContent?.trim()).filter(Boolean).join('|');
+                                const allRows = Array.from(table.querySelectorAll('tbody tr, tr'));
+                                if (allRows.length > 1) {
+                                    // Skip first row (header) and get data rows only
+                                    const dataRows = allRows.slice(1, 6); // Rows 2-6 (skip header)
+                                    if (dataRows.length > 0) {
+                                        const rowData = dataRows.map(row => {
+                                            const cells = Array.from(row.querySelectorAll('td, th'));
+                                            return cells.slice(0, 5).map(c => c.textContent?.trim() || '').filter(Boolean).join(',');
+                                        }).filter(r => r.length > 0);
+                                        return rowData.join('|');
+                                    }
+                                } else if (allRows.length === 1) {
+                                    return allRows[0].textContent?.trim() || null;
                                 }
                             }
                             return null;
                         }
                     """)
                     
-                    if current_data_hash and current_data_hash != initial_data_hash:
-                        data_changed = True
-                        logger.info(f"✅ Data changed! New hash: {current_data_hash[:100]}...")
-                        logger.info(f"✅ Tab '{tab_name}' is active AND data has changed (attempt {attempt+1})")
-                        tab_verified = True
-                        break
-                    elif current_data_hash:
-                        logger.debug(f"⏳ Data not changed yet (attempt {attempt+1}), waiting...")
+                    if current_data_hash:
+                        # Compare hashes (normalize in Python, not JavaScript)
+                        import re
+                        initial_normalized = re.sub(r'\s+', '', initial_data_hash).lower()
+                        current_normalized = re.sub(r'\s+', '', current_data_hash).lower()
+                        
+                        if current_normalized != initial_normalized:
+                            data_changed = True
+                            logger.info(f"✅ Data changed! Initial: {initial_data_hash[:50]}... → New: {current_data_hash[:50]}...")
+                            logger.info(f"✅ Tab '{tab_name}' is active AND data has changed (attempt {attempt+1})")
+                            tab_verified = True
+                            break
+                        else:
+                            logger.debug(f"⏳ Data not changed yet (attempt {attempt+1}), waiting... (hash: {current_data_hash[:50]}...)")
                     else:
                         logger.debug(f"⏳ No table data found yet (attempt {attempt+1}), waiting...")
                 except Exception as data_err:
@@ -960,11 +992,12 @@ async def export_tab(page: Page, tab_name: str, download_dir: Path):
         'a[aria-label*="Export" i]',
     ]
     
-    # ROOT FIX: Set up download listener BEFORE clicking using expect_download
-    # This ensures we catch ONLY the next download (not previous ones)
-    logger.info(f"⏳ Setting up download listener and clicking export for '{tab_name}'...")
+    # ROOT FIX: Set up download listener BEFORE clicking (must be active when click happens)
+    # expect_download context manager catches the NEXT download
+    logger.info(f"⏳ Setting up download listener (timeout: {EXPORT_TIMEOUT/1000}s) and clicking export...")
     
     async with page.expect_download(timeout=EXPORT_TIMEOUT) as download_info:
+        # Click button while download listener is active
         export_clicked = False
         for attempt in range(3):
             for sel in export_selectors:
@@ -975,7 +1008,7 @@ async def export_tab(page: Page, tab_name: str, download_dir: Path):
                     await locator.scroll_into_view_if_needed()
                     await asyncio.sleep(1)
                     
-                    # Click the button (download listener is active inside async with)
+                    # Click the button (download listener is active)
                     await locator.click(force=True)
                     logger.info(f"✅ Export button clicked via selector: {sel}")
                     export_clicked = True
@@ -1027,12 +1060,21 @@ async def export_tab(page: Page, tab_name: str, download_dir: Path):
             screenshot_path = f"/tmp/Export_button_fail_{tab_name.replace(' ', '_')}_{datetime.now().strftime('%H%M%S')}.png"
             await page.screenshot(path=screenshot_path, full_page=True)
             raise Exception(f"Export to Excel button not visible/clickable for {tab_name} after all retries (screenshot: {screenshot_path})")
+        
+        # Small wait for download to initiate after click
+        await asyncio.sleep(2)
     
-    # Download completed - save it
+    # Download received - save it
     logger.info(f"⏳ Download received, saving file for '{tab_name}'...")
-    download = await download_info.value
-    await download.save_as(file_path)
-    logger.info(f"💾 Download saved: {file_path} for tab '{tab_name}'")
+    try:
+        download = await download_info.value
+        await download.save_as(file_path)
+        logger.info(f"💾 Download saved: {file_path} for tab '{tab_name}'")
+    except Exception as download_err:
+        error_str = str(download_err)
+        if "timeout" in error_str.lower() or "Timeout" in error_str:
+            raise Exception(f"Download timeout for {tab_name} after {EXPORT_TIMEOUT/1000} seconds")
+        raise Exception(f"Download error for {tab_name}: {download_err}")
 
     await asyncio.sleep(2)
     
