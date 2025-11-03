@@ -716,7 +716,9 @@ async def click_advance_search(page: Page):
 async def export_tab(page: Page, tab_name: str, download_dir: Path):
     logger.info(f"📊 Exporting tab: {tab_name}")
     
-    # Try multiple selectors for tab clicking
+    # ROOT FIX: Try multiple strategies to click tab - ensure it actually switches
+    logger.info(f"🖱️ Clicking tab: '{tab_name}'")
+    
     tab_selectors = [
         f'text="{tab_name}"',
         f'a:has-text("{tab_name}")',
@@ -724,61 +726,159 @@ async def export_tab(page: Page, tab_name: str, download_dir: Path):
         f'li:has-text("{tab_name}")',
         f'[data-tab*="{tab_name}"]',
         f'[aria-label*="{tab_name}"]',
+        f'*:has-text("{tab_name}")',
     ]
     
     tab_clicked = False
+    
+    # Strategy 1: Try Playwright locator clicks
     for tab_sel in tab_selectors:
         try:
-            await click_force(page, tab_sel, timeout=5000, name=f"tab_{tab_name}")
-            tab_clicked = True
-            break
+            locator = page.locator(tab_sel).first
+            if await locator.is_visible(timeout=5000):
+                await locator.scroll_into_view_if_needed()
+                await asyncio.sleep(0.5)
+                await locator.click(force=True)
+                logger.info(f"✅ Clicked tab '{tab_name}' via selector: {tab_sel}")
+                tab_clicked = True
+                break
         except Exception as e:
             logger.debug(f"Tab selector {tab_sel} failed: {e}")
             continue
     
+    # Strategy 2: If Playwright failed, try JavaScript click
     if not tab_clicked:
-        raise Exception(f"Could not click tab: {tab_name}")
+        logger.warning(f"Playwright clicks failed, trying JavaScript click for tab '{tab_name}'")
+        try:
+            js_clicked = await page.evaluate(f"""
+                (tabName) => {{
+                    // Try to find tab by text content
+                    const allElements = Array.from(document.querySelectorAll('*'));
+                    for (let el of allElements) {{
+                        const text = (el.textContent || el.innerText || '').trim();
+                        if (text === tabName || text.includes(tabName)) {{
+                            // Check if it's clickable (button, link, or has click handler)
+                            if (el.tagName === 'BUTTON' || el.tagName === 'A' || 
+                                el.tagName === 'LI' || el.getAttribute('role') === 'tab' ||
+                                el.onclick || el.getAttribute('data-tab')) {{
+                                el.click();
+                                return true;
+                            }}
+                        }}
+                    }}
+                    return false;
+                }}
+            """, tab_name)
+            
+            if js_clicked:
+                logger.info(f"✅ Clicked tab '{tab_name}' via JavaScript")
+                tab_clicked = True
+                await asyncio.sleep(2)
+            else:
+                logger.error(f"❌ JavaScript could not find clickable element for tab '{tab_name}'")
+        except Exception as js_err:
+            logger.error(f"❌ JavaScript click failed: {js_err}")
     
-    # CRITICAL: Wait for tab content to actually load and verify tab name is visible/active
-    logger.info(f"⏳ Waiting for tab '{tab_name}' content to load (30s)...")
-    await asyncio.sleep(10)  # Initial wait for tab switch
+    if not tab_clicked:
+        screenshot_path = f"/tmp/tab_click_fail_{tab_name.replace(' ', '_')}_{datetime.now().strftime('%H%M%S')}.png"
+        await page.screenshot(path=screenshot_path, full_page=True)
+        raise Exception(f"Could not click tab: {tab_name} (screenshot: {screenshot_path})")
     
-    # Verify tab is active/selected (check for active class, aria-selected, or tab name in page)
-    max_verification_attempts = 10
+    # Small wait after click to let tab switch start
+    await asyncio.sleep(2)
+    
+    # ROOT FIX: Wait for tab content to actually CHANGE (not just tab activation)
+    logger.info(f"⏳ Waiting for tab '{tab_name}' to load and data to change...")
+    
+    # Capture initial data state BEFORE tab click (if available) to compare later
+    initial_data_hash = None
+    try:
+        # Try to get a hash of current table/grid data to compare
+        initial_data_hash = await page.evaluate("""
+            () => {
+                // Try to find table or grid and get a hash of its content
+                const tables = Array.from(document.querySelectorAll('table, [role="grid"], .k-grid, [data-role="grid"]'));
+                if (tables.length > 0) {
+                    const table = tables[0];
+                    const rows = Array.from(table.querySelectorAll('tbody tr, tr'));
+                    if (rows.length > 0) {
+                        // Get first few rows' text content as hash
+                        return rows.slice(0, 3).map(r => r.textContent?.trim()).filter(Boolean).join('|');
+                    }
+                }
+                return null;
+            }
+        """)
+        if initial_data_hash:
+            logger.info(f"📊 Captured initial data hash (first 3 rows): {initial_data_hash[:100]}...")
+    except Exception as hash_err:
+        logger.debug(f"Could not capture initial data hash: {hash_err}")
+    
+    # Wait for tab switch
+    await asyncio.sleep(5)  # Initial wait for tab switch
+    
+    # ROOT FIX: Verify tab is active AND data has actually changed
+    max_verification_attempts = 15
     tab_verified = False
+    data_changed = False
+    
     for attempt in range(max_verification_attempts):
         try:
-            # Check if tab is active/selected by looking for active indicators
+            # Check if tab is active/selected
+            active_found = False
             active_indicators = [
                 f'text="{tab_name}" >> ..active',
                 f'text="{tab_name}" >> ..selected',
                 f'a:has-text("{tab_name}") >> ..active',
                 f'button:has-text("{tab_name}") >> ..active',
+                f'li:has-text("{tab_name}") >> ..active',
                 f'[data-tab*="{tab_name}"][class*="active"]',
                 f'[aria-label*="{tab_name}"][aria-selected="true"]',
             ]
             
-            # Also check if page content includes the tab name or related indicators
-            page_content = await page.content()
-            page_text = await page.text_content()
-            
-            # Check if tab name appears in active elements or page indicators
             for indicator in active_indicators:
                 try:
                     element = await page.query_selector(indicator)
                     if element:
-                        tab_verified = True
-                        logger.info(f"✅ Verified tab '{tab_name}' is active (attempt {attempt+1})")
+                        active_found = True
                         break
                 except:
                     continue
             
-            # Also verify by checking if tab name appears in visible text/content
-            if tab_name.lower() in (page_text or "").lower()[:1000]:  # Check first 1000 chars
-                tab_verified = True
-                logger.info(f"✅ Verified tab '{tab_name}' content is visible (attempt {attempt+1})")
+            # CRITICAL: Verify data has actually changed
+            if initial_data_hash:
+                try:
+                    current_data_hash = await page.evaluate("""
+                        () => {
+                            const tables = Array.from(document.querySelectorAll('table, [role="grid"], .k-grid, [data-role="grid"]'));
+                            if (tables.length > 0) {
+                                const table = tables[0];
+                                const rows = Array.from(table.querySelectorAll('tbody tr, tr'));
+                                if (rows.length > 0) {
+                                    return rows.slice(0, 3).map(r => r.textContent?.trim()).filter(Boolean).join('|');
+                                }
+                            }
+                            return null;
+                        }
+                    """)
+                    
+                    if current_data_hash and current_data_hash != initial_data_hash:
+                        data_changed = True
+                        logger.info(f"✅ Data changed! New hash: {current_data_hash[:100]}...")
+                        logger.info(f"✅ Tab '{tab_name}' is active AND data has changed (attempt {attempt+1})")
+                        tab_verified = True
+                        break
+                    elif current_data_hash:
+                        logger.debug(f"⏳ Data not changed yet (attempt {attempt+1}), waiting...")
+                    else:
+                        logger.debug(f"⏳ No table data found yet (attempt {attempt+1}), waiting...")
+                except Exception as data_err:
+                    logger.debug(f"Data verification error: {data_err}")
             
-            if tab_verified:
+            # If we can't verify data change, at least verify tab is active
+            if active_found and not initial_data_hash:
+                tab_verified = True
+                logger.info(f"✅ Tab '{tab_name}' is active (attempt {attempt+1})")
                 break
             
             await asyncio.sleep(2)  # Wait 2 seconds before next verification attempt
@@ -788,18 +888,59 @@ async def export_tab(page: Page, tab_name: str, download_dir: Path):
             await asyncio.sleep(2)
     
     if not tab_verified:
-        logger.warning(f"⚠️ Could not verify tab '{tab_name}' is active, proceeding anyway...")
+        logger.warning(f"⚠️ Could not verify tab '{tab_name}' switched properly")
+        if initial_data_hash and not data_changed:
+            logger.error(f"❌ CRITICAL: Data did not change after clicking tab '{tab_name}'! This will export wrong data!")
+            # Take screenshot for debugging
+            screenshot_path = f"/tmp/tab_not_changed_{tab_name.replace(' ', '_')}_{datetime.now().strftime('%H%M%S')}.png"
+            await page.screenshot(path=screenshot_path, full_page=True)
+            logger.error(f"📸 Screenshot saved: {screenshot_path}")
+            
+            # ROOT FIX: If data didn't change and we have initial hash, fail the export
+            # This prevents exporting duplicate data
+            raise Exception(f"CRITICAL: Tab '{tab_name}' did not switch - data unchanged. Initial hash: {initial_data_hash[:50]}... Refusing to export duplicate data.")
     else:
-        logger.info(f"✅ Tab '{tab_name}' verified and ready for export")
+        logger.info(f"✅ Tab '{tab_name}' verified - tab active and data changed")
     
-    # Additional wait for full content load
-    await wait_full_load(page, 20, f"tab {tab_name}")
+    # Additional wait for full content load after verification
+    logger.info(f"⏳ Final wait for tab '{tab_name}' content to fully load...")
+    await wait_full_load(page, 15, f"tab {tab_name}")
+    
+    # USER REQUEST: Additional 40 seconds wait specifically for tab to fully load before export
+    logger.info(f"⏳ Waiting 40 seconds for tab '{tab_name}' to fully load before export...")
+    await asyncio.sleep(40)
+    logger.info(f"✅ 40 second wait completed - ready to export '{tab_name}'")
+    
+    # ROOT FIX: Final verification - capture actual data that will be exported
+    try:
+        final_data_sample = await page.evaluate("""
+            () => {
+                const tables = Array.from(document.querySelectorAll('table, [role="grid"], .k-grid, [data-role="grid"]'));
+                if (tables.length > 0) {
+                    const table = tables[0];
+                    const rows = Array.from(table.querySelectorAll('tbody tr, tr'));
+                    if (rows.length > 0) {
+                        // Get first row's first few cells
+                        const firstRow = rows[0];
+                        const cells = Array.from(firstRow.querySelectorAll('td, th'));
+                        return cells.slice(0, 5).map(c => c.textContent?.trim()).filter(Boolean);
+                    }
+                }
+                return [];
+            }
+        """)
+        if final_data_sample:
+            logger.info(f"🔍 Final data sample (first row, first 5 cells): {final_data_sample}")
+    except Exception as sample_err:
+        logger.debug(f"Could not capture final data sample: {sample_err}")
 
     # Step 3: Click "Export to excel" button
     # CRITICAL: Export button appears AFTER Advance search is clicked and tab is selected
     # The button has ID "downloadExcel" and class "btn btn-danger clsdisableAction"
     # HTML: <input type="button" value="Export to excel" id="downloadExcel" class="btn btn-danger clsdisableAction">
     logger.info(f"📥 Step 3: Looking for Export to Excel button for {tab_name}...")
+    
+    file_path = download_dir / f"{tab_name}.xlsx"
     
     export_selectors = [
         '#downloadExcel',  # Primary selector - exact ID from HTML
@@ -819,82 +960,79 @@ async def export_tab(page: Page, tab_name: str, download_dir: Path):
         'a[aria-label*="Export" i]',
     ]
     
-    export_clicked = False
-    for attempt in range(3):
-        for sel in export_selectors:
-            try:
-                # Wait up to 30 seconds for button to appear
-                await page.wait_for_selector(sel, timeout=30000)
-                locator = page.locator(sel).first
-                await locator.scroll_into_view_if_needed()
-                await asyncio.sleep(1)
-                await locator.click(force=True)
-                logger.info(f"✅ Export button clicked via selector: {sel}")
-                export_clicked = True
-                break
-            except Exception as e:
-                logger.debug(f"Export selector {sel} failed (attempt {attempt+1}/3): {e}")
-                await asyncio.sleep(2)
-                continue
-        if export_clicked:
-            break
+    # ROOT FIX: Set up download listener BEFORE clicking using expect_download
+    # This ensures we catch ONLY the next download (not previous ones)
+    logger.info(f"⏳ Setting up download listener and clicking export for '{tab_name}'...")
     
-    # If all selectors failed, try JavaScript fallback
-    if not export_clicked:
-        logger.warning("Standard click methods failed, trying JavaScript fallback...")
-        try:
-            js_clicked = await page.evaluate("""
-                () => {
-                    // First, try the specific ID from HTML: id="downloadExcel"
-                    const downloadExcelBtn = document.getElementById('downloadExcel');
-                    if (downloadExcelBtn) {
-                        downloadExcelBtn.click();
-                        return true;
-                    }
+    async with page.expect_download(timeout=EXPORT_TIMEOUT) as download_info:
+        export_clicked = False
+        for attempt in range(3):
+            for sel in export_selectors:
+                try:
+                    # Wait up to 30 seconds for button to appear
+                    await page.wait_for_selector(sel, timeout=30000)
+                    locator = page.locator(sel).first
+                    await locator.scroll_into_view_if_needed()
+                    await asyncio.sleep(1)
                     
-                    // Fallback: search by text/attributes
-                    const elements = Array.from(document.querySelectorAll('button, input[type="button"], a, [role="button"]'));
-                    for (let el of elements) {
-                        const text = (el.textContent || el.value || '').toLowerCase();
-                        const ariaLabel = (el.getAttribute('aria-label') || '').toLowerCase();
-                        const title = (el.getAttribute('title') || '').toLowerCase();
-                        if ((text.includes('export') && text.includes('excel')) || 
-                            ariaLabel.includes('export') || 
-                            title.includes('export')) {
-                            el.click();
+                    # Click the button (download listener is active inside async with)
+                    await locator.click(force=True)
+                    logger.info(f"✅ Export button clicked via selector: {sel}")
+                    export_clicked = True
+                    break
+                except Exception as e:
+                    logger.debug(f"Export selector {sel} failed (attempt {attempt+1}/3): {e}")
+                    await asyncio.sleep(2)
+                    continue
+            if export_clicked:
+                break
+        
+        # If all selectors failed, try JavaScript fallback
+        if not export_clicked:
+            logger.warning("Standard click methods failed, trying JavaScript fallback...")
+            try:
+                js_clicked = await page.evaluate("""
+                    () => {
+                        // First, try the specific ID from HTML: id="downloadExcel"
+                        const downloadExcelBtn = document.getElementById('downloadExcel');
+                        if (downloadExcelBtn) {
+                            downloadExcelBtn.click();
                             return true;
                         }
+                        
+                        // Fallback: search by text/attributes
+                        const elements = Array.from(document.querySelectorAll('button, input[type="button"], a, [role="button"]'));
+                        for (let el of elements) {
+                            const text = (el.textContent || el.value || '').toLowerCase();
+                            const ariaLabel = (el.getAttribute('aria-label') || '').toLowerCase();
+                            const title = (el.getAttribute('title') || '').toLowerCase();
+                            if ((text.includes('export') && text.includes('excel')) || 
+                                ariaLabel.includes('export') || 
+                                title.includes('export')) {
+                                el.click();
+                                return true;
+                            }
+                        }
+                        return false;
                     }
-                    return false;
-                }
-            """)
-            if js_clicked:
-                await asyncio.sleep(2)
-                logger.info("✅ Export button clicked via JavaScript")
-                export_clicked = True
-        except Exception as js_err:
-            logger.warning(f"JavaScript click failed: {js_err}")
+                """)
+                if js_clicked:
+                    await asyncio.sleep(2)
+                    logger.info("✅ Export button clicked via JavaScript")
+                    export_clicked = True
+            except Exception as js_err:
+                logger.warning(f"JavaScript click failed: {js_err}")
+        
+        if not export_clicked:
+            screenshot_path = f"/tmp/Export_button_fail_{tab_name.replace(' ', '_')}_{datetime.now().strftime('%H%M%S')}.png"
+            await page.screenshot(path=screenshot_path, full_page=True)
+            raise Exception(f"Export to Excel button not visible/clickable for {tab_name} after all retries (screenshot: {screenshot_path})")
     
-    if not export_clicked:
-        screenshot_path = f"/tmp/Export_button_fail_{tab_name.replace(' ', '_')}_{datetime.now().strftime('%H%M%S')}.png"
-        await page.screenshot(path=screenshot_path, full_page=True)
-        raise Exception(f"Export to Excel button not visible/clickable for {tab_name} after all retries (screenshot: {screenshot_path})")
-
-    download_event = asyncio.Event()
-    file_path = download_dir / f"{tab_name}.xlsx"
-    downloaded_file = []
-
-    async def handle_download(d: Download):
-        await d.save_as(file_path)
-        downloaded_file.append(file_path)
-        download_event.set()
-        logger.info(f"💾 Download saved: {file_path}")
-
-    page.on("download", handle_download)
-    try:
-        await asyncio.wait_for(download_event.wait(), timeout=EXPORT_TIMEOUT)
-    except asyncio.TimeoutError:
-        raise Exception(f"Download timeout for {tab_name}")
+    # Download completed - save it
+    logger.info(f"⏳ Download received, saving file for '{tab_name}'...")
+    download = await download_info.value
+    await download.save_as(file_path)
+    logger.info(f"💾 Download saved: {file_path} for tab '{tab_name}'")
 
     await asyncio.sleep(2)
     
