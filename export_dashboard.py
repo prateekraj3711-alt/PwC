@@ -39,6 +39,11 @@ TABS = [
     "BGV closed",
 ]
 
+# Lock to prevent concurrent exports
+export_lock = asyncio.Lock()
+export_in_progress = False
+current_export_session_id = None
+
 
 def get_sheets_service():
     if not GOOGLE_CREDENTIALS_JSON:
@@ -1178,35 +1183,72 @@ class ExportRequest(BaseModel):
 
 @app.post("/export-dashboard")
 async def export_endpoint(req: ExportRequest):
-    spreadsheet_id = req.spreadsheet_id or GOOGLE_SHEET_ID
-    if not spreadsheet_id:
-        raise HTTPException(status_code=400, detail="spreadsheet_id required (set GOOGLE_SHEET_ID env or provide in request)")
+    global export_in_progress, current_export_session_id
     
-    # Handle storage_state - ensure it's properly formatted
-    storage_state = req.storage_state
-    if storage_state:
-        # If Pydantic received it as a string (due to JSON double-encoding), parse it
-        if isinstance(storage_state, str):
-            try:
-                storage_state = json.loads(storage_state)
-                logger.info("✅ Parsed storage_state from string in request")
-            except json.JSONDecodeError:
-                raise HTTPException(
-                    status_code=400,
-                    detail="storage_state is a string but not valid JSON. Ensure Node.js sends it as an object, not a stringified JSON."
-                )
-        
-        # Validate it's a dict
-        if not isinstance(storage_state, dict):
+    # RULE 1: Only one export can run at a time (across all sessions)
+    # This prevents concurrent exports and ensures one session = one export run
+    if export_in_progress:
+        logger.warning(f"⚠️ Export already in progress for session {current_export_session_id} - rejecting concurrent request for session {req.session_id}")
+        raise HTTPException(
+            status_code=429,
+            detail=f"Export already in progress for session {current_export_session_id}. Only one export can run at a time. This request for session {req.session_id} is cancelled. Wait for the current export to finish and push data to sheets."
+        )
+    
+    # Acquire lock to prevent race conditions
+    async with export_lock:
+        # Double-check after acquiring lock (handle race condition)
+        if export_in_progress:
+            logger.warning(f"⚠️ Export already in progress for session {current_export_session_id} (race condition caught) - rejecting request for session {req.session_id}")
             raise HTTPException(
-                status_code=400,
-                detail=f"storage_state must be a dict or valid JSON string, got {type(storage_state)}"
+                status_code=429,
+                detail=f"Export already in progress for session {current_export_session_id}. Only one export can run at a time."
             )
         
-        logger.info(f"✅ Received storage_state with {len(storage_state.get('cookies', []))} cookies")
-    
-    result = await export_dashboard(req.session_id, spreadsheet_id, storage_state)
-    return JSONResponse(content=result)
+        # Mark this session as the current export
+        # This ensures: one session = one export run (any concurrent requests will be rejected above)
+        export_in_progress = True
+        current_export_session_id = req.session_id
+        logger.info(f"🔒 Export lock acquired - starting export for session {req.session_id}. All other concurrent requests will be cancelled.")
+        
+        try:
+            spreadsheet_id = req.spreadsheet_id or GOOGLE_SHEET_ID
+            if not spreadsheet_id:
+                raise HTTPException(status_code=400, detail="spreadsheet_id required (set GOOGLE_SHEET_ID env or provide in request)")
+            
+            # Handle storage_state - ensure it's properly formatted
+            storage_state = req.storage_state
+            if storage_state:
+                # If Pydantic received it as a string (due to JSON double-encoding), parse it
+                if isinstance(storage_state, str):
+                    try:
+                        storage_state = json.loads(storage_state)
+                        logger.info("✅ Parsed storage_state from string in request")
+                    except json.JSONDecodeError:
+                        raise HTTPException(
+                            status_code=400,
+                            detail="storage_state is a string but not valid JSON. Ensure Node.js sends it as an object, not a stringified JSON."
+                        )
+                
+                # Validate it's a dict
+                if not isinstance(storage_state, dict):
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"storage_state must be a dict or valid JSON string, got {type(storage_state)}"
+                    )
+                
+                logger.info(f"✅ Received storage_state with {len(storage_state.get('cookies', []))} cookies")
+            
+            result = await export_dashboard(req.session_id, spreadsheet_id, storage_state)
+            logger.info(f"✅ Export completed successfully for session {req.session_id} - data pushed to sheets")
+            return JSONResponse(content=result)
+        
+        finally:
+            # Always release the lock and clear session tracking, even if export fails
+            # This allows the next auto-run (4 hours later) to start fresh
+            export_in_progress = False
+            completed_session = current_export_session_id
+            current_export_session_id = None
+            logger.info(f"🔓 Export lock released - session {completed_session} export finished. Next auto-run can start fresh. Any queued/concurrent requests for this session were cancelled.")
 
 
 @app.get("/screenshots")
