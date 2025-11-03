@@ -141,9 +141,9 @@ def get_sheets_service():
 async def sync_to_sheets_with_audit(tab_name: str, excel_path: Path, spreadsheet_id: str):
     """
     Sync Excel data to Google Sheets (adds new, updates changed, skips identical).
-    Logs audit only for modified rows (not new ones).
+    Works for all tabs with robust error handling.
     
-    Returns: {"tab": tab_name, "new_rows": count, "updated_rows": count, "skipped": count, "audit_entries": count}
+    Returns: {"tab": tab_name, "new_rows": count, "updated_rows": count, "skipped": count}
     """
     try:
         # Get Google Sheets service
@@ -153,131 +153,265 @@ async def sync_to_sheets_with_audit(tab_name: str, excel_path: Path, spreadsheet
         logger.info(f"📊 Starting incremental sync for {tab_name}...")
         
         # Read Excel data
-        df_new = pd.read_excel(excel_path, engine="openpyxl").fillna("").astype(str)
-        
-        # Fetch existing sheet data
         try:
-            sheet_data = (
-                sheets.values()
-                .get(spreadsheetId=spreadsheet_id, range=f"'{tab_name}'!A:Z")
-                .execute()
-                .get("values", [])
-            )
-        except Exception:
+            df_new = pd.read_excel(excel_path, engine="openpyxl").fillna("").astype(str)
+            logger.info(f"✅ Loaded {len(df_new)} rows from Excel ({len(df_new.columns)} columns)")
+        except Exception as e:
+            logger.error(f"❌ Failed to read Excel file for {tab_name}: {e}")
+            return {"tab": tab_name, "error": f"Failed to read Excel: {str(e)}"}
+        
+        if df_new.empty:
+            logger.warning(f"⚠️ Excel file for {tab_name} is empty - skipping sync")
+            return {"tab": tab_name, "new_rows": 0, "updated_rows": 0, "skipped": 0, "warning": "Empty Excel file"}
+        
+        # Check if sheet exists, create if not
+        try:
+            # Try to get sheet metadata
+            spreadsheet = sheets.get(spreadsheetId=spreadsheet_id).execute()
+            sheet_exists = any(sheet.get("properties", {}).get("title") == tab_name 
+                             for sheet in spreadsheet.get("sheets", []))
+            
+            if not sheet_exists:
+                logger.info(f"📋 Sheet '{tab_name}' doesn't exist - creating new sheet...")
+                # Create new sheet
+                sheets.batchUpdate(
+                    spreadsheetId=spreadsheet_id,
+                    body={"requests": [{"addSheet": {"properties": {"title": tab_name}}}]}
+                ).execute()
+                logger.info(f"✅ Created new sheet '{tab_name}'")
+                sheet_data = []
+            else:
+                # Fetch existing sheet data - use dynamic range (up to column ZZ for 702 columns)
+                try:
+                    # Try A:ZZ first (covers most cases)
+                    sheet_data = (
+                        sheets.values()
+                        .get(spreadsheetId=spreadsheet_id, range=f"'{tab_name}'!A:ZZ")
+                        .execute()
+                        .get("values", [])
+                    )
+                except Exception:
+                    # Fallback to A:Z if A:ZZ fails
+                    try:
+                        sheet_data = (
+                            sheets.values()
+                            .get(spreadsheetId=spreadsheet_id, range=f"'{tab_name}'!A:Z")
+                            .execute()
+                            .get("values", [])
+                        )
+                    except Exception:
+                        sheet_data = []
+        except Exception as e:
+            logger.warning(f"⚠️ Could not check/create sheet '{tab_name}': {e} - assuming sheet exists")
             sheet_data = []
         
+        # Parse existing sheet data
         if sheet_data:
             headers = sheet_data[0]
             df_existing = pd.DataFrame(sheet_data[1:], columns=headers)
+            logger.info(f"✅ Loaded {len(df_existing)} existing rows from sheet '{tab_name}' ({len(df_existing.columns)} columns)")
         else:
             df_existing = pd.DataFrame(columns=df_new.columns)
+            logger.info(f"📋 No existing data in sheet '{tab_name}' - will create new sheet with headers")
         
-        # Align columns safely
-        df_new = df_new.reindex(columns=df_existing.columns, fill_value="") if not df_existing.empty else df_new
+        # Align columns - merge all columns from both DataFrames
+        all_columns = list(dict.fromkeys(list(df_existing.columns) + list(df_new.columns)))  # Preserve order, no duplicates
+        
+        # Ensure both DataFrames have all columns
+        for col in all_columns:
+            if col not in df_existing.columns:
+                df_existing[col] = ""
+            if col not in df_new.columns:
+                df_new[col] = ""
+        
+        # Reorder columns to match (use df_new column order as primary)
+        df_existing = df_existing[all_columns]
+        df_new = df_new[all_columns]
         
         # Normalize (remove type diff, trim spaces)
         df_existing = df_existing.fillna("").astype(str).apply(lambda x: x.str.strip())
         df_new = df_new.fillna("").astype(str).apply(lambda x: x.str.strip())
         
-        # Identify unique key column
-        UNIQUE_KEY = "Candidate ID" if "Candidate ID" in df_new.columns else df_new.columns[0]
+        # Identify unique key column (handle variations: "Candidate ID" vs "CandidateID")
+        UNIQUE_KEY = None
+        key_candidates = ["Candidate ID", "CandidateID", "Candidate_Id", "CandidateID", df_new.columns[0] if len(df_new.columns) > 0 else None]
+        for key_candidate in key_candidates:
+            if key_candidate and key_candidate in df_new.columns:
+                UNIQUE_KEY = key_candidate
+                break
+        
+        if UNIQUE_KEY is None or UNIQUE_KEY not in df_new.columns:
+            # Final fallback - use first available column
+            UNIQUE_KEY = df_new.columns[0] if len(df_new.columns) > 0 else None
+            if UNIQUE_KEY is None:
+                logger.error(f"❌ No columns found in Excel file for {tab_name}")
+                return {"tab": tab_name, "error": "No columns found in Excel file"}
+        
+        # Ensure UNIQUE_KEY exists in both DataFrames
+        if df_existing.empty:
+            # No existing data - UNIQUE_KEY from df_new is fine
+            pass
+        elif UNIQUE_KEY not in df_existing.columns:
+            # Try to find matching column in existing
+            found_match = False
+            for key_candidate in ["Candidate ID", "CandidateID", "Candidate_Id"]:
+                if key_candidate in df_existing.columns:
+                    df_existing = df_existing.rename(columns={key_candidate: UNIQUE_KEY})
+                    found_match = True
+                    break
+            if not found_match and len(df_existing.columns) > 0:
+                # Use first column of existing as key
+                first_col = df_existing.columns[0]
+                df_existing = df_existing.rename(columns={first_col: UNIQUE_KEY})
+                # Also update df_new if needed
+                if first_col in df_new.columns and first_col != UNIQUE_KEY:
+                    # Merge the two columns
+                    df_new[UNIQUE_KEY] = df_new[UNIQUE_KEY].fillna(df_new[first_col])
+        
+        logger.info(f"🔑 Using unique key column: '{UNIQUE_KEY}'")
+        
+        # Ensure UNIQUE_KEY column is valid (not empty for all rows in df_new)
+        if df_new[UNIQUE_KEY].fillna("").eq("").all():
+            logger.warning(f"⚠️ UNIQUE_KEY column '{UNIQUE_KEY}' is empty for all rows in {tab_name} - using row index as fallback")
+            df_new[UNIQUE_KEY] = df_new.index.astype(str)
+            if not df_existing.empty:
+                df_existing[UNIQUE_KEY] = df_existing.index.astype(str)
         
         # Merge datasets to detect changes
-        merged = pd.merge(
-            df_existing, df_new,
-            on=UNIQUE_KEY,
-            how="outer",
-            indicator=True,
-            suffixes=("_old", "_new")
-        )
-        
-        new_rows = merged[merged["_merge"] == "right_only"][df_new.columns]
-        updated_rows = []
-        audit_log_entries = []
-        
-        # Detect changes for existing rows
-        for _, row in merged[merged["_merge"] == "both"].iterrows():
-            changed_cols = []
-            for col in df_existing.columns:
-                if col == UNIQUE_KEY:
-                    continue
-                old_val = str(row.get(f"{col}_old", "")).strip()
-                new_val = str(row.get(f"{col}_new", "")).strip()
-                if old_val != new_val:
-                    changed_cols.append((col, old_val, new_val))
+        try:
+            merged = pd.merge(
+                df_existing, df_new,
+                on=UNIQUE_KEY,
+                how="outer",
+                indicator=True,
+                suffixes=("_old", "_new")
+            )
+        except Exception as merge_err:
+            logger.error(f"❌ Merge failed for {tab_name}: {merge_err}")
+            # Fallback: treat all as new rows if merge fails
+            logger.warning(f"⚠️ Falling back to append-all strategy for {tab_name}")
+            merged = pd.DataFrame()
+            new_rows = df_new.copy()
+            updated_rows = []
+        else:
+            # Extract new rows - use columns with "_new" suffix from merged DataFrame
+            new_rows_mask = merged["_merge"] == "right_only"
+            if new_rows_mask.any():
+                # Get columns with "_new" suffix, plus UNIQUE_KEY
+                new_cols = [col for col in merged.columns if col.endswith("_new")] + [UNIQUE_KEY]
+                # Filter to only columns that exist
+                new_cols = [col for col in new_cols if col in merged.columns]
+                if new_cols:
+                    new_rows_data = merged[new_rows_mask][new_cols].copy()
+                    # Rename columns back to original names (remove "_new" suffix)
+                    rename_dict = {col: col.replace("_new", "") for col in new_cols if col.endswith("_new")}
+                    new_rows_data = new_rows_data.rename(columns=rename_dict)
+                    # Ensure all columns from df_new are present
+                    for col in df_new.columns:
+                        if col not in new_rows_data.columns:
+                            new_rows_data[col] = ""
+                    # Reorder to match df_new column order
+                    new_rows = new_rows_data[df_new.columns]
+                else:
+                    new_rows = pd.DataFrame(columns=df_new.columns)
+            else:
+                new_rows = pd.DataFrame(columns=df_new.columns)
             
-            if changed_cols:
-                updated_row = {col: row.get(f"{col}_new", "") for col in df_existing.columns}
-                updated_rows.append(updated_row)
+            updated_rows = []
+            
+            # Detect changes for existing rows
+            for _, row in merged[merged["_merge"] == "both"].iterrows():
+                changed_cols = []
+                for col in all_columns:
+                    if col == UNIQUE_KEY:
+                        continue
+                    old_col = f"{col}_old"
+                    new_col = f"{col}_new"
+                    if old_col in merged.columns and new_col in merged.columns:
+                        try:
+                            old_val = str(row.get(old_col, "")).strip()
+                            new_val = str(row.get(new_col, "")).strip()
+                            if old_val != new_val:
+                                changed_cols.append((col, old_val, new_val))
+                        except Exception:
+                            continue
                 
-                # Create detailed audit log entries
-                for c, o, n in changed_cols:
-                    audit_log_entries.append([
-                        datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                        tab_name,
-                        row[UNIQUE_KEY],
-                        "UPDATED",
-                        c,
-                        o,
-                        n
-                    ])
-                
-                change_details = ", ".join([f"{c}: '{o}' → '{n}'" for c, o, n in changed_cols])
-                logger.info(f"✏️ {tab_name} | {UNIQUE_KEY}={row[UNIQUE_KEY]} | {change_details}")
+                if changed_cols:
+                    # Build updated row using "_new" suffix columns
+                    updated_row = {UNIQUE_KEY: row[UNIQUE_KEY]}
+                    for col in all_columns:
+                        if col == UNIQUE_KEY:
+                            continue
+                        new_col = f"{col}_new"
+                        if new_col in merged.columns:
+                            updated_row[col] = str(row.get(new_col, "")).strip()
+                        else:
+                            updated_row[col] = str(row.get(col, "")).strip()
+                    updated_rows.append(updated_row)
+                    
+                    change_details = ", ".join([f"{c}: '{o[:20]}...' → '{n[:20]}...'" if len(str(o)) > 20 or len(str(n)) > 20 else f"{c}: '{o}' → '{n}'" 
+                                               for c, o, n in changed_cols[:2]])  # Log first 2 changes
+                    if len(changed_cols) > 2:
+                        change_details += f" (+{len(changed_cols) - 2} more)"
+                    logger.info(f"✏️ {tab_name} | {UNIQUE_KEY}={row[UNIQUE_KEY]} | {change_details}")
         
-        # ➕ Add only new rows (no audit log for these)
+        # If no existing sheet data, write headers first
+        if not sheet_data and not new_rows.empty:
+            # Write headers
+            headers = [all_columns]
+            try:
+                sheets.values().update(
+                    spreadsheetId=spreadsheet_id,
+                    range=f"'{tab_name}'!A1",
+                    valueInputOption="RAW",
+                    body={"values": headers},
+                ).execute()
+                logger.info(f"📋 Written headers to new sheet '{tab_name}'")
+            except Exception as h_err:
+                logger.warning(f"⚠️ Could not write headers to '{tab_name}': {h_err}")
+        
+        # ➕ Add only new rows
         if not new_rows.empty:
-            sheets.values().append(
-                spreadsheetId=spreadsheet_id,
-                range=f"'{tab_name}'!A1",
-                valueInputOption="RAW",
-                insertDataOption="INSERT_ROWS",
-                body={"values": new_rows.values.tolist()},
-            ).execute()
-            logger.info(f"➕ Added {len(new_rows)} new rows to '{tab_name}'")
+            try:
+                # Prepare data for Google Sheets (list of lists)
+                new_rows_values = new_rows.fillna("").values.tolist()
+                sheets.values().append(
+                    spreadsheetId=spreadsheet_id,
+                    range=f"'{tab_name}'!A1",
+                    valueInputOption="RAW",
+                    insertDataOption="INSERT_ROWS",
+                    body={"values": new_rows_values},
+                ).execute()
+                logger.info(f"➕ Added {len(new_rows)} new rows to '{tab_name}'")
+            except Exception as append_err:
+                logger.error(f"❌ Failed to append new rows to '{tab_name}': {append_err}")
+                return {"tab": tab_name, "error": f"Failed to append rows: {str(append_err)}"}
         
         # ✏️ Update modified rows
         if updated_rows:
-            df_updates = pd.DataFrame(updated_rows)
-            for _, row in df_updates.iterrows():
-                row_index = df_existing[df_existing[UNIQUE_KEY] == row[UNIQUE_KEY]].index
-                if not row_index.empty:
-                    sheets.values().update(
-                        spreadsheetId=spreadsheet_id,
-                        range=f"'{tab_name}'!A{row_index[0] + 2}",
-                        valueInputOption="RAW",
-                        body={"values": [row.tolist()]},
-                    ).execute()
-            logger.info(f"✅ Updated {len(updated_rows)} modified rows in '{tab_name}'")
-        
-        # 🧾 Append audit logs (only for modified rows)
-        if audit_log_entries:
             try:
-                sheets.values().append(
-                    spreadsheetId=spreadsheet_id,
-                    range="'Audit Log'!A1",
-                    valueInputOption="RAW",
-                    insertDataOption="INSERT_ROWS",
-                    body={"values": audit_log_entries},
-                ).execute()
-                logger.info(f"🕒 Logged {len(audit_log_entries)} change events to 'Audit Log'")
-            except Exception:
-                # Create "Audit Log" sheet if not found
-                logger.warning("⚠️ 'Audit Log' sheet missing — creating new one.")
-                service.spreadsheets().batchUpdate(
-                    spreadsheetId=spreadsheet_id,
-                    body={"requests": [{"addSheet": {"properties": {"title": "Audit Log"}}}]}
-                ).execute()
-                headers = [["Timestamp", "Tab Name", "Candidate ID", "Action", "Column", "Old Value", "New Value"]]
-                sheets.values().update(
-                    spreadsheetId=spreadsheet_id,
-                    range="'Audit Log'!A1",
-                    valueInputOption="RAW",
-                    body={"values": headers + audit_log_entries},
-                ).execute()
-                logger.info("✅ Created and populated new 'Audit Log' sheet")
+                df_updates = pd.DataFrame(updated_rows)
+                for _, row in df_updates.iterrows():
+                    # Find row index in existing data
+                    if not df_existing.empty:
+                        row_indices = df_existing[df_existing[UNIQUE_KEY] == row[UNIQUE_KEY]].index
+                        if not row_indices.empty:
+                            # Google Sheets uses 1-based indexing, and row 1 is header
+                            sheet_row_num = row_indices[0] + 2
+                            # Convert row to list matching column order
+                            row_values = [str(row.get(col, "")) for col in all_columns]
+                            sheets.values().update(
+                                spreadsheetId=spreadsheet_id,
+                                range=f"'{tab_name}'!A{sheet_row_num}",
+                                valueInputOption="RAW",
+                                body={"values": [row_values]},
+                            ).execute()
+                logger.info(f"✅ Updated {len(updated_rows)} modified rows in '{tab_name}'")
+            except Exception as update_err:
+                logger.error(f"❌ Failed to update rows in '{tab_name}': {update_err}")
+                # Don't fail completely - new rows were added successfully
         
-        skipped = len(df_existing) - len(updated_rows) - len(new_rows) if not df_existing.empty else 0
+        skipped = len(df_existing) - len(updated_rows) if not df_existing.empty else 0
         logger.info(f"🟢 Skipped {max(skipped, 0)} identical rows in '{tab_name}'")
         logger.info(f"✅ Completed sync for {tab_name}")
         
@@ -285,8 +419,7 @@ async def sync_to_sheets_with_audit(tab_name: str, excel_path: Path, spreadsheet
             "tab": tab_name,
             "new_rows": len(new_rows),
             "updated_rows": len(updated_rows),
-            "skipped": max(skipped, 0),
-            "audit_entries": len(audit_log_entries)
+            "skipped": max(skipped, 0)
         }
         
     except Exception as e:
